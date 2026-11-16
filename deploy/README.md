@@ -104,12 +104,22 @@ in the conversation.
   updated (for example `unattended-upgrades`), and use SSH keys only.
 - **Data in transit to Claude:** whatever a tool returns becomes part of your Claude
   conversation. The tools are read-only and never return GPS coordinates.
+- **Removing `/auth` altogether (optional):** Caddy already hides it from the internet. If
+  you want it gone from the server too, add `-disable-auth-endpoint` to the
+  `garmin-mcp` service's `command` in `compose.yaml` (for example
+  `command: ["-addr", ":8808", "-key-store", "/data/garmin.key", "-disable-auth-endpoint"]`).
+  The key then comes only from `secrets/garmin_key`, the admin port is no longer useful,
+  and rotating the key means replacing that file and restarting. This variant has not been
+  run through the full Compose test.
 - **What the server refuses:** requests for any hostname other than yours, any request
   without the token, and (at Caddy) every path except `/mcp`.
 - **Garmin's terms:** the Personal API is for your own data only. Do not share this
   server with other people.
 
 ## Try it locally first
+
+(To run just the server on your own machine, without Caddy or a domain, see
+[`docs/running-locally.md`](../docs/running-locally.md).)
 
 You can rehearse the whole stack on your own machine with a throwaway name and ports
 that do not clash with anything. Caddy then uses its own local certificate authority,

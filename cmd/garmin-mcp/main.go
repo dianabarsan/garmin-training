@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,6 +51,7 @@ type config struct {
 	garminURL    string
 	logLevel     string
 	envKey       string // initial API key from GARMIN_PERSONAL_API_KEY[_FILE]
+	disableAuth  bool   // serve no /auth endpoint or key page
 	healthcheck  bool
 	showVersion  bool
 }
@@ -78,15 +80,20 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	if err != nil {
 		return err
 	}
-	loadInitialKey(ctx, creds, cfg.envKey, log)
+	supplied := loadInitialKey(ctx, creds, cfg.envKey, !cfg.disableAuth, log)
+	if cfg.disableAuth && !supplied {
+		// With no endpoint to provide a key, a server that starts without one can
+		// never work, so stop and say how to fix it.
+		return errors.New("-disable-auth-endpoint needs a key from the start: set GARMIN_PERSONAL_API_KEY (or GARMIN_PERSONAL_API_KEY_FILE), or point -key-store at a file that already holds one")
+	}
 
 	ln, err := net.Listen("tcp", cfg.addr)
 	if err != nil {
 		return err
 	}
 	bound := ln.Addr().String()
-	log.Info("listening", "addr", bound, "mcp", "/mcp", "auth", "/auth", "token_required", cfg.token != "", "key_loaded", creds.Status().Authenticated)
-	if !creds.Status().Authenticated {
+	log.Info("listening", "addr", bound, "mcp", "/mcp", "auth_endpoint", !cfg.disableAuth, "token_required", cfg.token != "", "key_loaded", creds.Status().Authenticated)
+	if !creds.Status().Authenticated && !cfg.disableAuth {
 		log.Info("no API key yet: open the address in a browser, or POST {\"api_key\": \"...\"} to /auth")
 	}
 	if ready != nil {
@@ -107,6 +114,10 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	if err != nil {
 		return config{}, err
 	}
+	disableDefault, err := boolEnv(getenv, "GARMIN_MCP_DISABLE_AUTH_ENDPOINT")
+	if err != nil {
+		return config{}, err
+	}
 
 	fs := flag.NewFlagSet("garmin-mcp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -115,13 +126,14 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8808", "address to listen on; a non-loopback address requires -token")
 	fs.StringVar(&cfg.token, "token", tokenDefault, "require this bearer token on /mcp and /auth (env GARMIN_MCP_TOKEN or GARMIN_MCP_TOKEN_FILE)")
 	fs.StringVar(&allowedHosts, "allowed-host", getenv("GARMIN_MCP_ALLOWED_HOSTS"), "comma-separated public hostnames this server may be reached as, e.g. garmin.example.com; set it behind a reverse proxy (env GARMIN_MCP_ALLOWED_HOSTS)")
+	fs.BoolVar(&cfg.disableAuth, "disable-auth-endpoint", disableDefault, "do not serve /auth or the key page (both answer 404), so the key can only come from GARMIN_PERSONAL_API_KEY[_FILE] or -key-store; use it when the server is reachable from outside (env GARMIN_MCP_DISABLE_AUTH_ENDPOINT)")
 	fs.BoolVar(&cfg.healthcheck, "healthcheck", false, "probe a running server at -addr and exit 0 if it is healthy (for container health checks)")
 	fs.StringVar(&cfg.keyStore, "key-store", getenv("GARMIN_MCP_KEY_STORE"), "file in which to keep the API key between restarts, mode 0600 (env GARMIN_MCP_KEY_STORE); the key stays in memory only when unset")
 	fs.StringVar(&cfg.garminURL, "garmin-url", getenv("GARMIN_PERSONAL_API_BASE_URL"), "Garmin API base URL; for testing")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth.\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth\n(unless -disable-auth-endpoint is set).\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -160,13 +172,14 @@ func newServer(cfg config, log *slog.Logger) (*mcpserver.Credentials, *mcpserver
 		clientOpts = append(clientOpts, garmin.WithBaseURL(cfg.garminURL))
 	}
 	srv, err := mcpserver.New(mcpserver.Config{
-		API:          garmin.New(clientOpts...),
-		Credentials:  creds,
-		Token:        cfg.token,
-		Addr:         cfg.addr,
-		AllowedHosts: cfg.allowedHosts,
-		Logger:       log,
-		Version:      version,
+		API:                 garmin.New(clientOpts...),
+		Credentials:         creds,
+		Token:               cfg.token,
+		Addr:                cfg.addr,
+		AllowedHosts:        cfg.allowedHosts,
+		DisableAuthEndpoint: cfg.disableAuth,
+		Logger:              log,
+		Version:             version,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -175,24 +188,34 @@ func newServer(cfg config, log *slog.Logger) (*mcpserver.Credentials, *mcpserver
 }
 
 // loadInitialKey activates the starting API key: one given explicitly (the
-// environment or a secret file) wins, otherwise the key store's. A key Garmin
-// rejects is reported but not fatal, because it can still be provided at /auth.
-func loadInitialKey(ctx context.Context, creds *mcpserver.Credentials, envKey string, log *slog.Logger) {
+// environment or a secret file) wins, otherwise the key store's. It reports
+// whether a key was supplied at all. A key Garmin rejects still counts as
+// supplied: it is reported but not fatal, because it can be replaced (at /auth
+// when that endpoint is enabled, otherwise by restarting with a new key).
+func loadInitialKey(ctx context.Context, creds *mcpserver.Credentials, envKey string, authEndpoint bool, log *slog.Logger) (supplied bool) {
 	if envKey != "" {
 		vctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
 		if err := creds.Set(vctx, envKey); err != nil {
-			log.Warn("the API key from GARMIN_PERSONAL_API_KEY was not accepted; provide a key at /auth", "reason", reasonOf(err))
-			return
+			remedy := "provide a key at /auth"
+			if !authEndpoint {
+				remedy = "restart with a new key"
+			}
+			log.Warn("the API key from GARMIN_PERSONAL_API_KEY was not accepted; "+remedy, "reason", reasonOf(err))
+			return true
 		}
 		log.Info("API key from the environment accepted")
-		return
+		return true
 	}
-	if ok, err := creds.LoadStored(); err != nil {
+	ok, err := creds.LoadStored()
+	if err != nil {
 		log.Warn("could not read the stored key", "err", err)
-	} else if ok {
+		return false
+	}
+	if ok {
 		log.Info("API key loaded from the key store")
 	}
+	return ok
 }
 
 // serve runs the HTTP server on ln until ctx is cancelled, then shuts it down.
@@ -277,6 +300,19 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// boolEnv reads an optional boolean environment variable; unset means false.
+func boolEnv(getenv func(string) string, name string) (bool, error) {
+	v := strings.TrimSpace(getenv(name))
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false, got %q", name, v)
+	}
+	return b, nil
 }
 
 // probeHealth GETs /healthz on a server listening at addr. A wildcard or empty

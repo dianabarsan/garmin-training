@@ -1,0 +1,34 @@
+# systemd *user* service for running the Garmin MCP server on your own machine.
+# See docs/running-locally.md for the steps.
+#
+#   mkdir -p -m 700 ~/.config/garmin-mcp ~/.config/systemd/user
+#   cp deploy/garmin-mcp.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now garmin-mcp
+
+[Unit]
+Description=Garmin MCP server (your Garmin Connect data for AI agents)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Build the binary first: go build -o ~/.local/bin/garmin-mcp ./cmd/garmin-mcp
+ExecStart=%h/.local/bin/garmin-mcp -key-store %h/.config/garmin-mcp/key
+
+# Optional settings, one KEY=value per line (keep the file private, chmod 600):
+#   GARMIN_MCP_TOKEN=...          require a bearer token
+#   GARMIN_MCP_ALLOWED_HOSTS=...  public hostname when reached through a tunnel
+# The leading "-" means the file may be absent.
+EnvironmentFile=-%h/.config/garmin-mcp/env
+
+Restart=on-failure
+RestartSec=5
+
+# The server only needs to read its binary and write its key file.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/garmin-mcp
+
+[Install]
+WantedBy=default.target

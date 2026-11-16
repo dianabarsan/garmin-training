@@ -42,7 +42,7 @@ func addTool[In, Out any](s *Server, name, title, desc string, h func(context.Co
 		out, err := h(ctx, in)
 		if err != nil {
 			var zero Out
-			return nil, zero, userError(err)
+			return nil, zero, s.userError(err)
 		}
 		return nil, out, nil
 	})
@@ -401,7 +401,7 @@ func (s *Server) authStatus(_ context.Context, _ struct{}) (statusOut, error) {
 	st := s.creds.Status()
 	out := statusOut{Authenticated: st.Authenticated}
 	if !st.Authenticated {
-		out.Help = "Ask the user to open this server's address in a browser and paste their Garmin Personal API key (created at connect.garmin.com/app/settings/personalApiToken), or POST {\"api_key\": \"...\"} to /auth."
+		out.Help = capitalize(s.askUserToProvideKey()) + ". The key is created at connect.garmin.com/app/settings/personalApiToken."
 	}
 	return out, nil
 }

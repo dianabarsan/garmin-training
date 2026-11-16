@@ -46,6 +46,11 @@ type Config struct {
 	// Addr is the address the server will listen on. A non-loopback address
 	// requires Token.
 	Addr string
+	// DisableAuthEndpoint removes /auth and the key page entirely (both answer
+	// 404), so the key can only come from the server's own configuration: an
+	// environment variable, a secret file or a key store. Use it when the server
+	// is reachable from outside, so a leaked token can never replace the key.
+	DisableAuthEndpoint bool
 	// AllowedHosts are the public hostnames (no scheme or port) the server may
 	// be reached as, for example behind a reverse proxy. When set, requests
 	// for any other Host are refused; localhost names stay allowed for health
@@ -62,10 +67,11 @@ type Config struct {
 
 // Server is the MCP server plus its HTTP endpoints.
 type Server struct {
-	api   garminAPI
-	creds *Credentials
-	log   *slog.Logger
-	now   func() time.Time
+	api          garminAPI
+	creds        *Credentials
+	log          *slog.Logger
+	now          func() time.Time
+	authEndpoint bool // whether /auth and the key page are served
 
 	mcp     *mcp.Server
 	handler http.Handler
@@ -80,7 +86,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Addr != "" && !IsLoopbackAddr(cfg.Addr) && cfg.Token == "" {
 		return nil, fmt.Errorf("mcpserver: refusing to listen on %q without a token: it is not a loopback address, so anyone who can reach it could read your health data and replace your key", cfg.Addr)
 	}
-	s := &Server{api: cfg.API, creds: cfg.Credentials, log: cfg.Logger, now: cfg.Now}
+	s := &Server{api: cfg.API, creds: cfg.Credentials, log: cfg.Logger, now: cfg.Now, authEndpoint: !cfg.DisableAuthEndpoint}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
@@ -93,7 +99,7 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s.mcp = mcp.NewServer(&mcp.Implementation{Name: "garmin-mcp", Title: "Garmin Connect (personal)", Version: version},
-		&mcp.ServerOptions{Instructions: instructions})
+		&mcp.ServerOptions{Instructions: s.instructions()})
 	s.registerTools()
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp },
@@ -113,9 +119,11 @@ func New(cfg Config) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", requireToken(cfg.Token, protect.Handler(mcpHandler)))
-	mux.Handle("/auth", requireToken(cfg.Token, protect.Handler(authHandler(s.creds, s.log))))
-	if cfg.Token == "" {
-		mux.Handle("/", protect.Handler(indexHandler(s.creds)))
+	if s.authEndpoint {
+		mux.Handle("/auth", requireToken(cfg.Token, protect.Handler(authHandler(s.creds, s.log))))
+		if cfg.Token == "" {
+			mux.Handle("/", protect.Handler(indexHandler(s.creds)))
+		}
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -125,27 +133,49 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// Handler returns the HTTP handler serving /mcp, /auth, "/" and /healthz.
+// Handler returns the HTTP handler serving /mcp and /healthz, and unless the
+// auth endpoint is disabled, /auth and the key page at "/".
 func (s *Server) Handler() http.Handler { return s.handler }
 
 // MCPServer returns the underlying MCP server, for connecting over other
 // transports (the tests use an in-memory one).
 func (s *Server) MCPServer() *mcp.Server { return s.mcp }
 
-const instructions = `Read-only access to the user's own Garmin Connect data (Personal API).
+// instructions is the text MCP clients show their model about this server.
+func (s *Server) instructions() string {
+	return `Read-only access to the user's own Garmin Connect data (Personal API).
 
 Dates are the user's local calendar dates in YYYY-MM-DD form. Tools that take a date range default to the last 7 days ending today. Ranges are limited to 366 days.
 Units: distances in metres, durations in seconds, speeds in metres per second, pace in seconds per kilometre, weights in kilograms, heart rate in beats per minute, elevation in metres.
-If a tool reports that no API key has been provided, ask the user to open the server's address in a browser (or POST their Garmin Personal API key to /auth); you cannot provide it yourself.
+If a tool reports that no API key has been provided, ` + s.askUserToProvideKey() + `; you cannot provide it yourself.
 Activities: use list_activities to find an activity id, then get_activity, get_activity_splits or get_activity_series. Garmin does not expose laps or individual strength sets.`
+}
+
+// askUserToProvideKey says what to ask the user to do when no key is set. It
+// depends on whether the server has an endpoint for providing one.
+func (s *Server) askUserToProvideKey() string {
+	if s.authEndpoint {
+		return "ask the user to open this server's address in a browser and paste their Garmin Personal API key (or POST it to /auth)"
+	}
+	return "ask the user to set GARMIN_PERSONAL_API_KEY (or GARMIN_PERSONAL_API_KEY_FILE) on the server, or restore its key store, and restart it; this server has no endpoint for providing a key"
+}
+
+// askUserForNewKey says what to ask the user to do when Garmin rejects the key.
+func (s *Server) askUserForNewKey() string {
+	const create = "ask the user to create a new one at connect.garmin.com/app/settings/personalApiToken and "
+	if s.authEndpoint {
+		return create + "provide it at /auth"
+	}
+	return create + "give it to the server through GARMIN_PERSONAL_API_KEY (or GARMIN_PERSONAL_API_KEY_FILE) and restart it"
+}
 
 // userError turns a failure into a message that tells an agent what to do next.
-func userError(err error) error {
+func (s *Server) userError(err error) error {
 	switch {
 	case errors.Is(err, ErrNotAuthenticated):
-		return errors.New("no Garmin API key has been provided. Ask the user to open this server's address in a browser and paste their Garmin Personal API key (or POST it to /auth), then retry")
+		return errors.New("no Garmin API key has been provided. " + capitalize(s.askUserToProvideKey()) + ", then retry")
 	case errors.Is(err, auth.ErrInvalidKey), errors.Is(err, garmin.ErrUnauthorized):
-		return errors.New("Garmin rejected the API key; it has probably expired or been deleted. Ask the user to create a new one at connect.garmin.com/app/settings/personalApiToken and provide it at /auth")
+		return errors.New("Garmin rejected the API key; it has probably expired or been deleted. " + capitalize(s.askUserForNewKey()))
 	case errors.Is(err, garmin.ErrRateLimited):
 		return errors.New("Garmin is rate limiting requests; wait a little and retry")
 	case errors.Is(err, garmin.ErrNotFound):
@@ -154,6 +184,13 @@ func userError(err error) error {
 		return errors.New("this activity has no distance data (for example strength training or an indoor workout), so it cannot be split by distance")
 	}
 	return err
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // normalizeHosts validates and lower-cases allowed hostnames. A port, if given,

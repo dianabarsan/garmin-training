@@ -33,6 +33,10 @@ Then provide your key in any of these ways:
 
 Point your MCP client at `http://127.0.0.1:8808/mcp` (streamable HTTP).
 
+More ways to run it on your own machine (install as a command, a background service,
+Docker, trying it from claude.ai through a tunnel) are in
+[`docs/running-locally.md`](docs/running-locally.md).
+
 ### The `/auth` endpoint
 
 | Request | Effect |
@@ -51,6 +55,7 @@ with mode `0600` in a `0700` directory); `DELETE /auth` removes it.
 | `-addr` (default `127.0.0.1:8808`) | Address to listen on. |
 | `-token` / `GARMIN_MCP_TOKEN` | Require `Authorization: Bearer <token>` on `/mcp` and `/auth`. |
 | `-allowed-host` / `GARMIN_MCP_ALLOWED_HOSTS` | Public hostname(s), comma separated, that the server may be reached as. Set it behind a reverse proxy; other `Host` values are refused. |
+| `-disable-auth-endpoint` / `GARMIN_MCP_DISABLE_AUTH_ENDPOINT` | Serve no `/auth` or key page (both answer 404), so a leaked token can never replace the key. The key must then come from `GARMIN_PERSONAL_API_KEY[_FILE]` or an existing `-key-store`; the server refuses to start without one. Use it whenever the server is reachable from outside. |
 | `-key-store` / `GARMIN_MCP_KEY_STORE` | Persist the key in this file. |
 | `GARMIN_PERSONAL_API_KEY` | Key to use at startup (wins over the key store). |
 | `GARMIN_MCP_TOKEN_FILE`, `GARMIN_PERSONAL_API_KEY_FILE` | Read the token / key from a file instead (Docker secrets); setting both forms of one is an error. |
@@ -68,6 +73,8 @@ built for a single user on one machine:
 - State-changing requests carrying a foreign `Origin` or a cross-site `Sec-Fetch-Site`
   are refused (browser CSRF defence).
 - It **refuses to start on a non-loopback address without `-token`**.
+- `-disable-auth-endpoint` removes `/auth` and the key page entirely, even for a request
+  that carries the token. Use it when the server is exposed through a tunnel or proxy.
 - When `-token` is set the browser form at `/` is not served (a form cannot send the
   bearer header); use the JSON endpoint.
 - The key is never returned by any endpoint or tool, never logged, and never part of an
