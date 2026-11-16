@@ -1,0 +1,60 @@
+# Garmin MCP server behind Caddy (automatic HTTPS).
+#
+#   cd deploy && docker compose up -d --build
+#
+# See deploy/README.md for the full walkthrough.
+name: garmin-mcp
+
+services:
+  garmin-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      # The public name clients use; anything else is refused.
+      GARMIN_MCP_ALLOWED_HOSTS: ${MCP_DOMAIN:?set MCP_DOMAIN in deploy/.env}
+      # Secrets come from files, not environment variables, so they do not show
+      # up in `docker inspect`.
+      GARMIN_MCP_TOKEN_FILE: /run/secrets/mcp_token
+      GARMIN_PERSONAL_API_KEY_FILE: /run/secrets/garmin_key
+    secrets: [mcp_token, garmin_key]
+    volumes:
+      - garmin-data:/data
+    # Reachable only from the server itself (for example through an SSH tunnel),
+    # never from the internet. Used to replace the Garmin key.
+    ports:
+      - "127.0.0.1:${ADMIN_PORT:-8808}:8808"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      garmin-mcp:
+        condition: service_healthy
+    environment:
+      MCP_DOMAIN: ${MCP_DOMAIN:?set MCP_DOMAIN in deploy/.env}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+
+secrets:
+  mcp_token:
+    file: ./secrets/mcp_token
+  garmin_key:
+    file: ./secrets/garmin_key
+
+volumes:
+  garmin-data:
+  caddy-data:
+  caddy-config:

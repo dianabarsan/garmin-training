@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+#
+# Build from the repository root:
+#   docker build -f deploy/Dockerfile -t garmin-mcp .
+ARG GO_VERSION=1.27
+
+FROM golang:${GO_VERSION} AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+# Only the source directories are copied, so a stray `key` file or captured
+# data in the repository can never end up in the image.
+COPY *.go ./
+COPY auth ./auth
+COPY internal ./internal
+COPY cmd ./cmd
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/garmin-mcp ./cmd/garmin-mcp
+# The key store lives here; owned by the unprivileged user the image runs as.
+RUN mkdir /data
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/garmin-mcp /garmin-mcp
+COPY --from=build --chown=65532:65532 /data /data
+USER 65532:65532
+EXPOSE 8808
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/garmin-mcp", "-healthcheck", "-addr", ":8808"]
+ENTRYPOINT ["/garmin-mcp"]
+CMD ["-addr", ":8808", "-key-store", "/data/garmin.key"]

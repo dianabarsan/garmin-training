@@ -1,0 +1,25 @@
+# Caddy obtains and renews a Let's Encrypt certificate for MCP_DOMAIN by itself.
+# To get expiry notices, add a global block at the top:  { email you@example.com }
+
+{$MCP_DOMAIN} {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Only the MCP endpoint is public. /auth (where the Garmin key is replaced)
+	# and the key page are NOT reachable from the internet.
+	@mcp path /mcp /mcp/*
+	handle @mcp {
+		# flush_interval -1 keeps MCP's event streams flowing instead of buffered.
+		reverse_proxy garmin-mcp:8808 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

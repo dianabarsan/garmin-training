@@ -360,3 +360,23 @@ func TestDefaultBaseURLMatchesClient(t *testing.T) {
 
 // Compile-time check that the token source plugs into the client.
 var _ garmin.TokenSource = (*auth.TokenSource)(nil)
+
+func TestTokenSource_ExpiresAt(t *testing.T) {
+	t.Parallel()
+	clk := &clock{t: epoch}
+	f := newFake(t, "k", clk)
+	ts := f.source("k", clk)
+
+	if got := ts.ExpiresAt(); !got.IsZero() {
+		t.Errorf("before any exchange ExpiresAt = %v, want zero", got)
+	}
+	if f.calls.Load() != 0 {
+		t.Error("ExpiresAt must not trigger an exchange")
+	}
+	if _, err := ts.AccessToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ts.ExpiresAt(), epoch.Add(24*time.Hour); !got.Equal(want) {
+		t.Errorf("ExpiresAt = %v, want %v", got, want)
+	}
+}

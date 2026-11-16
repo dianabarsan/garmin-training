@@ -1,0 +1,9 @@
+# Never let secrets or personal captures into a build context or image.
+key
+*.key
+testdata/live
+deploy/secrets
+deploy/.env
+.env
+.git
+.idea

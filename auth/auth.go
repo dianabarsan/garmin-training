@@ -161,6 +161,17 @@ func (s *TokenSource) AccessToken(ctx context.Context) (string, error) {
 	return t.AccessToken, nil
 }
 
+// ExpiresAt returns when the currently cached access token expires, or the zero
+// time when none is cached. It does not trigger an exchange.
+func (s *TokenSource) ExpiresAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.token.AccessToken == "" {
+		return time.Time{}
+	}
+	return s.token.ExpiresAt
+}
+
 func (s *TokenSource) usable(t Token, fp string) bool {
 	return t.AccessToken != "" &&
 		t.KeyFingerprint == fp &&
