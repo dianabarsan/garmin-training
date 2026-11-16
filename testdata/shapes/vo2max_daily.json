@@ -1,0 +1,12 @@
+[
+  {
+    "cycling": null,
+    "generic": {
+      "calendarDate": "",
+      "sport": "",
+      "subSport": "",
+      "vo2MaxPreciseValue": 0.5,
+      "vo2MaxValue": 0.5
+    }
+  }
+]

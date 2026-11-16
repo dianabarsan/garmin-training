@@ -72,9 +72,10 @@ func (c *Client) HeartRate(ctx context.Context, date time.Time) (HeartRateDay, e
 
 // HRVBaseline is the user's personal HRV range in milliseconds.
 type HRVBaseline struct {
-	LowUpper      int `json:"lowUpper"`
-	BalancedLow   int `json:"balancedLow"`
-	BalancedUpper int `json:"balancedUpper"`
+	LowUpper      int     `json:"lowUpper"`
+	BalancedLow   int     `json:"balancedLow"`
+	BalancedUpper int     `json:"balancedUpper"`
+	MarkerValue   float64 `json:"markerValue"`
 }
 
 // HRVSummary is Garmin's overnight heart-rate-variability rollup, in
@@ -87,6 +88,8 @@ type HRVSummary struct {
 	Status            string       `json:"status"` // e.g. "BALANCED"
 	FeedbackPhrase    string       `json:"feedbackPhrase"`
 	Baseline          *HRVBaseline `json:"baseline"`
+	// CreatedAt is when Garmin computed the summary.
+	CreatedAt Timestamp `json:"createTimeStamp"`
 }
 
 // HRVReading is one overnight HRV measurement in milliseconds.
@@ -101,11 +104,15 @@ type HRV struct {
 	rawJSON
 	Summary    *HRVSummary  `json:"hrvSummary"`
 	Readings   []HRVReading `json:"hrvReadings"`
+	Start      Timestamp    `json:"startTimestampGMT"`
+	End        Timestamp    `json:"endTimestampGMT"`
 	SleepStart Timestamp    `json:"sleepStartTimestampGMT"`
 	SleepEnd   Timestamp    `json:"sleepEndTimestampGMT"`
 }
 
-// HRV returns heart-rate-variability data for the night ending on date.
+// HRV returns heart-rate-variability data for the night ending on date. When
+// Garmin has no data for the date (HTTP 204) it returns the zero HRV, whose
+// Summary is nil.
 func (c *Client) HRV(ctx context.Context, date time.Time) (HRV, error) {
 	var raw json.RawMessage
 	if err := c.get(ctx, "/hrv-service/hrv/"+dateParam(date), nil, &raw); err != nil {
@@ -214,4 +221,22 @@ func numberAt(row []json.RawMessage, i int) (float64, bool) {
 		return 0, false
 	}
 	return *f, true
+}
+
+// HRVRange returns the nightly HRV summary for each day in [start, end], oldest
+// first. Days Garmin has no HRV for are absent, and a range with no data at all
+// (HTTP 204) returns an empty slice. It carries the summaries only; use HRV for
+// a night's individual readings.
+func (c *Client) HRVRange(ctx context.Context, start, end time.Time) ([]HRVSummary, error) {
+	if err := checkRange(start, end); err != nil {
+		return nil, err
+	}
+	var env struct {
+		Summaries []HRVSummary `json:"hrvSummaries"`
+	}
+	path := "/hrv-service/hrv/daily/" + dateParam(start) + "/" + dateParam(end)
+	if err := c.get(ctx, path, nil, &env); err != nil {
+		return nil, err
+	}
+	return env.Summaries, nil
 }

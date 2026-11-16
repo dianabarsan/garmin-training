@@ -30,6 +30,9 @@ type rawSetter[T any] interface {
 // decodeOne unmarshals b into T and retains the raw bytes.
 func decodeOne[T any, P rawSetter[T]](b json.RawMessage) (T, error) {
 	var v T
+	if len(b) == 0 { // HTTP 204: Garmin has no data
+		return v, nil
+	}
 	if err := json.Unmarshal(b, &v); err != nil {
 		return v, err
 	}
@@ -40,6 +43,9 @@ func decodeOne[T any, P rawSetter[T]](b json.RawMessage) (T, error) {
 // decodeList unmarshals a JSON array of objects, retaining each raw element.
 // A JSON null decodes to a nil slice.
 func decodeList[T any, P rawSetter[T]](b json.RawMessage) ([]T, error) {
+	if len(b) == 0 { // HTTP 204: Garmin has no data
+		return nil, nil
+	}
 	var raws []json.RawMessage
 	if err := json.Unmarshal(b, &raws); err != nil {
 		return nil, err

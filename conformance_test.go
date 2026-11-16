@@ -33,6 +33,9 @@ func TestShapesDecode(t *testing.T) {
 		"/wellness-service/wellness/dailyHeartRate":                     "heart_rate_daily",
 		"/hrv-service/hrv/2026-11-15":                                   "hrv_day",
 		"/wellness-service/wellness/bodyBattery/reports/daily":          "body_battery",
+		"/biometric-service/heartRateZones/v2":                          "heart_rate_zones",
+		"/hrv-service/hrv/daily/2026-11-09/2026-11-15":                  "hrv_daily_range",
+		"/metrics-service/metrics/maxmet/daily/2026-11-09/2026-11-15":   "vo2max_daily",
 	}
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name, ok := routes[r.URL.Path]
@@ -83,4 +86,16 @@ func TestShapesDecode(t *testing.T) {
 	check("HRV", err)
 	_, err = c.BodyBattery(ctx, week, day)
 	check("BodyBattery", err)
+	_, err = c.HRVRange(ctx, week, day)
+	check("HRVRange", err)
+	zs, err := c.HeartRateZones(ctx)
+	check("HeartRateZones", err)
+	if len(zs) == 0 {
+		t.Error("HeartRateZones shape decoded to nothing")
+	}
+	vo2, err := c.VO2Max(ctx, week, day)
+	check("VO2Max", err)
+	if len(vo2) == 0 || vo2[0].Generic == nil || len(vo2[0].Raw()) == 0 {
+		t.Errorf("VO2Max shape decoded to %+v", vo2)
+	}
 }

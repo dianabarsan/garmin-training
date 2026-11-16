@@ -1,0 +1,53 @@
+{
+  "averageSpO2": 0.5,
+  "avgSleepSpO2": 0.5,
+  "avgTomorrowSleepSpO2": 0.5,
+  "calendarDate": "",
+  "endTimestampGMT": "",
+  "endTimestampLocal": "",
+  "lastSevenDaysAvgSpO2": 0.5,
+  "latestSpO2": 1,
+  "latestSpO2TimestampGMT": "",
+  "latestSpO2TimestampLocal": "",
+  "lowestSpO2": 1,
+  "monitoringEnvironmentValues": [
+    [
+      1
+    ]
+  ],
+  "monitoringEnvironmentValuesDescriptorList": [
+    {
+      "monEnvValueDescIndex": 1,
+      "monEnvValueDescKey": ""
+    }
+  ],
+  "sleepEndTimestampGMT": "",
+  "sleepEndTimestampLocal": "",
+  "sleepStartTimestampGMT": "",
+  "sleepStartTimestampLocal": "",
+  "spO2HourlyAverages": [
+    [
+      1
+    ]
+  ],
+  "spO2HourlyAveragesDescriptorList": [
+    {
+      "spo2ValueDescIndex": 1,
+      "spo2ValueDescKey": ""
+    }
+  ],
+  "spO2SingleValues": null,
+  "spO2SingleValuesDescriptorList": [
+    {
+      "spo2ValueDescriptorIndex": 1,
+      "spo2ValueDescriptorKey": ""
+    }
+  ],
+  "startTimestampGMT": "",
+  "startTimestampLocal": "",
+  "tomorrowSleepEndTimestampGMT": "",
+  "tomorrowSleepEndTimestampLocal": "",
+  "tomorrowSleepStartTimestampGMT": "",
+  "tomorrowSleepStartTimestampLocal": "",
+  "userProfilePK": 1
+}

@@ -106,7 +106,9 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, out 
 	}
 	defer resp.Body.Close()
 
-	if out == nil {
+	// HTTP 204 is how Garmin says "no data for that date". Leave out untouched
+	// so the caller sees its zero value, instead of failing on an empty body.
+	if out == nil || resp.StatusCode == http.StatusNoContent {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}

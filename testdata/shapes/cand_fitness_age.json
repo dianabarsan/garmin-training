@@ -1,0 +1,27 @@
+{
+  "chronologicalAge": 1,
+  "components": {
+    "bmi": {
+      "lastMeasurementDate": "",
+      "stale": false,
+      "value": 0.5
+    },
+    "rhr": {
+      "stale": false,
+      "value": 1
+    },
+    "vigorousDaysAvg": {
+      "numOfWeeksForIm": 1,
+      "stale": false,
+      "value": 0.5
+    },
+    "vigorousMinutesAvg": {
+      "numOfWeeksForIm": 1,
+      "stale": false,
+      "value": 0.5
+    }
+  },
+  "fitnessAge": 0.5,
+  "lastUpdated": "",
+  "previousFitnessAge": 0.5
+}

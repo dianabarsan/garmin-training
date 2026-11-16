@@ -833,3 +833,170 @@ func TestActivityDetail_ElevationFields(t *testing.T) {
 		t.Errorf("detail sentinel: %+v err %v", d2.Summary, err)
 	}
 }
+
+// --- HTTP 204 "no data" -----------------------------------------------------
+
+func noContentClient(t *testing.T) *garmin.Client {
+	t.Helper()
+	return newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+}
+
+func TestNoContentMeansNoData(t *testing.T) {
+	t.Parallel()
+	c := noContentClient(t)
+	ctx := context.Background()
+
+	if h, err := c.HRV(ctx, d2); err != nil || h.Summary != nil || len(h.Readings) != 0 {
+		t.Errorf("HRV: %+v err %v", h, err)
+	}
+	if got, err := c.HRVRange(ctx, d1, d2); err != nil || len(got) != 0 {
+		t.Errorf("HRVRange: %v err %v", got, err)
+	}
+	if s, err := c.Sleep(ctx, d2); err != nil || s.ID != 0 {
+		t.Errorf("Sleep: %+v err %v", s, err)
+	}
+	if got, err := c.SleepRange(ctx, d1, d2); err != nil || len(got) != 0 {
+		t.Errorf("SleepRange: %v err %v", got, err)
+	}
+	if h, err := c.HeartRate(ctx, d2); err != nil || len(h.Samples) != 0 {
+		t.Errorf("HeartRate: %+v err %v", h, err)
+	}
+	if got, err := c.BodyBattery(ctx, d1, d2); err != nil || len(got) != 0 {
+		t.Errorf("BodyBattery: %v err %v", got, err)
+	}
+	if got, err := c.DailySummaries(ctx, d1, d2); err != nil || len(got) != 0 {
+		t.Errorf("DailySummaries: %v err %v", got, err)
+	}
+	if got, err := c.Steps(ctx, d1, d2); err != nil || len(got) != 0 {
+		t.Errorf("Steps: %v err %v", got, err)
+	}
+	if got, err := c.VO2Max(ctx, d1, d2); err != nil || len(got) != 0 {
+		t.Errorf("VO2Max: %v err %v", got, err)
+	}
+	if got, err := c.Activities(ctx, garmin.ActivitiesOptions{}); err != nil || len(got) != 0 {
+		t.Errorf("Activities: %v err %v", got, err)
+	}
+	if s, err := c.ActivitySeries(ctx, 1); err != nil || len(s.Points) != 0 {
+		t.Errorf("ActivitySeries: %+v err %v", s, err)
+	}
+}
+
+func TestNoContent_DoesNotHideRealEmptyBodies(t *testing.T) {
+	t.Parallel()
+	// A 200 with no body is still a protocol problem, only 204 means "no data".
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	if _, err := c.UserSettings(context.Background()); err == nil {
+		t.Error("200 with empty body must still be an error for decoded endpoints")
+	}
+}
+
+// --- HRV range --------------------------------------------------------------
+
+func TestHRVRange(t *testing.T) {
+	t.Parallel()
+	c, last := serve(t, `{"userProfilePk":1,"hrvSummaries":[
+	  {"calendarDate":"2026-11-14","weeklyAvg":40,"lastNightAvg":43,"lastNight5MinHigh":69,"status":"BALANCED","feedbackPhrase":"HRV_BALANCED_2",
+	   "createTimeStamp":"2026-11-14T06:41:09.123","baseline":{"lowUpper":36,"balancedLow":37,"balancedUpper":50,"markerValue":0.55}},
+	  {"calendarDate":"2026-11-15","weeklyAvg":41,"lastNightAvg":39,"lastNight5MinHigh":99,"status":"UNBALANCED","createTimeStamp":"2026-11-15T06:30:00.0"}]}`)
+	got, err := c.HRVRange(context.Background(), d1, d2)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	if last.URL.Path != "/hrv-service/hrv/daily/2026-11-09/2026-11-15" {
+		t.Errorf("path = %s", last.URL.Path)
+	}
+	a, b := got[0], got[1]
+	if a.CalendarDate != "2026-11-14" || a.LastNightAvg != 43 || a.WeeklyAvg != 40 || a.LastNight5MinHigh != 69 || a.Status != "BALANCED" {
+		t.Errorf("first = %+v", a)
+	}
+	if a.Baseline == nil || a.Baseline.BalancedLow != 37 || a.Baseline.BalancedUpper != 50 || a.Baseline.MarkerValue != 0.55 {
+		t.Errorf("baseline = %+v", a.Baseline)
+	}
+	if want := time.Date(2026, 11, 14, 6, 41, 9, 123000000, time.UTC); !a.CreatedAt.Equal(want) {
+		t.Errorf("CreatedAt = %v, want %v", a.CreatedAt.Time, want)
+	}
+	if b.Status != "UNBALANCED" || b.Baseline != nil || b.LastNightAvg != 39 {
+		t.Errorf("second = %+v", b)
+	}
+	if _, err := c.HRVRange(context.Background(), d2, d1); !errors.Is(err, garmin.ErrInvalidRange) {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestHRV_StartEndTimestamps(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `{"startTimestampGMT":"2026-11-14T22:00:00.0","endTimestampGMT":"2026-11-15T06:00:00.0",
+	  "hrvSummary":{"calendarDate":"2026-11-15","lastNightAvg":50,"baseline":{"markerValue":0.5}}}`)
+	h, err := c.HRV(context.Background(), d2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.End.Sub(h.Start.Time) != 8*time.Hour || h.Summary == nil || h.Summary.Baseline.MarkerValue != 0.5 {
+		t.Errorf("hrv = %+v", h)
+	}
+}
+
+// --- VO2 max ----------------------------------------------------------------
+
+func TestVO2Max(t *testing.T) {
+	t.Parallel()
+	c, last := serve(t, `[
+	  {"generic":{"calendarDate":"2026-11-10","sport":"RUNNING","subSport":"GENERIC","vo2MaxValue":47.0,"vo2MaxPreciseValue":46.9},"cycling":null},
+	  {"generic":{"calendarDate":"2026-11-14","sport":"RUNNING","subSport":"GENERIC","vo2MaxValue":48.0,"vo2MaxPreciseValue":47.6},
+	   "cycling":{"calendarDate":"2026-11-14","sport":"CYCLING","subSport":"ROAD","vo2MaxValue":52.0,"vo2MaxPreciseValue":51.8}}]`)
+	got, err := c.VO2Max(context.Background(), d1, d2)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	if last.URL.Path != "/metrics-service/metrics/maxmet/daily/2026-11-09/2026-11-15" {
+		t.Errorf("path = %s", last.URL.Path)
+	}
+	if _, has := last.URL.Query()["sport"]; has {
+		t.Errorf("no sport filter was requested but query = %v", last.URL.Query())
+	}
+	g := got[0].Generic
+	if g == nil || g.CalendarDate != "2026-11-10" || g.Sport != "RUNNING" || g.SubSport != "GENERIC" || g.Value != 47 || g.Precise != 46.9 {
+		t.Errorf("generic = %+v", g)
+	}
+	if got[0].Cycling != nil {
+		t.Errorf("null cycling must be nil: %+v", got[0].Cycling)
+	}
+	if cy := got[1].Cycling; cy == nil || cy.Sport != "CYCLING" || cy.Value != 52 || got[1].Generic.Precise != 47.6 {
+		t.Errorf("entry with cycling = %+v / %+v", got[1].Generic, cy)
+	}
+	if !strings.Contains(string(got[0].Raw()), `"cycling":null`) {
+		t.Errorf("raw = %s", got[0].Raw())
+	}
+}
+
+func TestVO2Max_SportsAreRepeatedParams(t *testing.T) {
+	t.Parallel()
+	c, last := serve(t, `[]`)
+	got, err := c.VO2Max(context.Background(), d1, d2, "running", "CYCLING")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("got %v err %v", got, err)
+	}
+	if s := last.URL.Query()["sport"]; len(s) != 2 || s[0] != "running" || s[1] != "CYCLING" {
+		t.Errorf("sport params = %v", s)
+	}
+}
+
+func TestVO2Max_ErrorsAndRange(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	var apiErr *garmin.APIError
+	if _, err := c.VO2Max(context.Background(), d1, d2, "bogus"); !errors.As(err, &apiErr) || apiErr.StatusCode != 400 {
+		t.Errorf("unknown sport err = %v", err)
+	}
+	if _, err := c.VO2Max(context.Background(), d2, d1); !errors.Is(err, garmin.ErrInvalidRange) {
+		t.Errorf("range err = %v", err)
+	}
+	c2, _ := serve(t, `{"not":"a list"}`)
+	if _, err := c2.VO2Max(context.Background(), d1, d2); err == nil {
+		t.Error("expected decode error")
+	}
+}
