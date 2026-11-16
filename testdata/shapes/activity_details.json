@@ -1,0 +1,80 @@
+{
+  "activityDetailMetrics": [
+    {
+      "metrics": [
+        0.5
+      ]
+    }
+  ],
+  "activityId": 1,
+  "detailsAvailable": false,
+  "geoPolylineDTO": {
+    "endPoint": {
+      "altitude": null,
+      "cumulativeAscent": null,
+      "cumulativeDescent": null,
+      "distanceFromPreviousPoint": null,
+      "distanceInMeters": null,
+      "extendedCoordinate": false,
+      "lat": 0.5,
+      "lon": 0.5,
+      "speed": 0.5,
+      "time": 1,
+      "timerStart": false,
+      "timerStop": false,
+      "valid": false
+    },
+    "maxLat": 0.5,
+    "maxLon": 0.5,
+    "minLat": 0.5,
+    "minLon": 0.5,
+    "polyline": [
+      {
+        "altitude": null,
+        "cumulativeAscent": null,
+        "cumulativeDescent": null,
+        "distanceFromPreviousPoint": null,
+        "distanceInMeters": null,
+        "extendedCoordinate": false,
+        "lat": 0.5,
+        "lon": 0.5,
+        "speed": 0.5,
+        "time": 1,
+        "timerStart": false,
+        "timerStop": false,
+        "valid": false
+      }
+    ],
+    "startPoint": {
+      "altitude": null,
+      "cumulativeAscent": null,
+      "cumulativeDescent": null,
+      "distanceFromPreviousPoint": null,
+      "distanceInMeters": null,
+      "extendedCoordinate": false,
+      "lat": 0.5,
+      "lon": 0.5,
+      "speed": 0.5,
+      "time": 1,
+      "timerStart": false,
+      "timerStop": false,
+      "valid": false
+    }
+  },
+  "heartRateDTOs": null,
+  "measurementCount": 1,
+  "metricDescriptors": [
+    {
+      "key": "",
+      "metricsIndex": 1,
+      "unit": {
+        "factor": 0.5,
+        "id": 1,
+        "key": ""
+      }
+    }
+  ],
+  "metricsCount": 1,
+  "pendingData": null,
+  "totalMetricsCount": 1
+}

@@ -32,3 +32,6 @@ key
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Raw live API responses (personal data: GPS, heart rate). Never commit.
+testdata/live/

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -128,10 +130,14 @@ func TestActivities_Query(t *testing.T) {
 		opts garmin.ActivitiesOptions
 		want url.Values
 	}{
-		{"defaults", garmin.ActivitiesOptions{}, url.Values{"start": {"0"}, "limit": {"20"}}},
+		{"defaults", garmin.ActivitiesOptions{}, url.Values{"start": {"0"}, "limit": {"99"}}},
 		{"paging", garmin.ActivitiesOptions{Start: 40, Limit: 10}, url.Values{"start": {"40"}, "limit": {"10"}}},
+		{"child type only", garmin.ActivitiesOptions{SubTypeKey: "strength_training"},
+			url.Values{"start": {"0"}, "limit": {"99"}, "activitySubType": {"strength_training"}}},
+		{"parent and child", garmin.ActivitiesOptions{TypeKey: "running", SubTypeKey: "trail_running"},
+			url.Values{"start": {"0"}, "limit": {"99"}, "activityType": {"running"}, "activitySubType": {"trail_running"}}},
 		{"filters", garmin.ActivitiesOptions{StartDate: d1, EndDate: d2, TypeKey: "running"},
-			url.Values{"start": {"0"}, "limit": {"20"}, "startDate": {"2026-11-09"}, "endDate": {"2026-11-15"}, "activityType": {"running"}}},
+			url.Values{"start": {"0"}, "limit": {"99"}, "startDate": {"2026-11-09"}, "endDate": {"2026-11-15"}, "activityType": {"running"}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -592,5 +598,238 @@ func TestBodyBattery_TwoColumnLayoutFromLiveAPI(t *testing.T) {
 	}
 	if s := got[0].Samples; len(s) != 2 || s[0].Level != 80 || s[1].Level != 76 {
 		t.Errorf("samples = %+v", s)
+	}
+}
+
+const strengthJSON = `{
+  "activityId": 5, "activityName": "Strength",
+  "activityType": {"typeId": 13, "typeKey": "strength_training", "parentTypeId": 29},
+  "duration": 4003.8, "movingDuration": 2714.0, "calories": 347,
+  "activeSets": 7, "totalSets": 7, "totalReps": 80,
+  "summarizedExerciseSets": [
+    {"category": "SQUAT", "subCategory": "DUMBBELL_FRONT_SQUAT", "reps": 60, "volume": 1800000, "duration": 290926.5, "sets": 4, "maxWeight": 30000},
+    {"category": "WARM_UP", "reps": 4, "volume": 0, "duration": 512278, "sets": 1, "maxWeight": 0},
+    {"category": "CRUNCH", "subCategory": "CROSSED_ARMS_CRUNCH", "reps": 16, "volume": 0, "duration": 250000, "sets": 2, "maxWeight": 0}
+  ]}`
+
+func TestActivities_StrengthExercises(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, "["+strengthJSON+"]")
+	got, err := c.Activities(context.Background(), garmin.ActivitiesOptions{})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	a := got[0]
+	if a.ActiveSets != 7 || a.TotalSets != 7 || a.TotalReps != 80 {
+		t.Errorf("totals = %d/%d/%d", a.ActiveSets, a.TotalSets, a.TotalReps)
+	}
+	if len(a.Exercises) != 3 {
+		t.Fatalf("exercises = %+v", a.Exercises)
+	}
+	sq := a.Exercises[0]
+	if sq.Category != "SQUAT" || sq.SubCategory != "DUMBBELL_FRONT_SQUAT" || sq.Sets != 4 || sq.Reps != 60 {
+		t.Errorf("squat = %+v", sq)
+	}
+	// Garmin sends grams and milliseconds.
+	if sq.MaxWeightKg != 30 || sq.VolumeKg != 1800 || sq.DurationSeconds != 290.9265 {
+		t.Errorf("squat units = %v kg max, %v kg volume, %v s", sq.MaxWeightKg, sq.VolumeKg, sq.DurationSeconds)
+	}
+	if w := a.Exercises[1]; w.SubCategory != "" || w.MaxWeightKg != 0 || w.VolumeKg != 0 || w.Reps != 4 {
+		t.Errorf("warm-up (no subcategory, no weight) = %+v", w)
+	}
+	var sets, reps int
+	var dur float64
+	for _, e := range a.Exercises {
+		sets += e.Sets
+		reps += e.Reps
+		dur += e.DurationSeconds
+	}
+	if sets != a.TotalSets || reps != a.TotalReps {
+		t.Errorf("exercise sums %d sets / %d reps != totals %d / %d", sets, reps, a.TotalSets, a.TotalReps)
+	}
+	if !near(dur, 290.9265+512.278+250, 1e-9) {
+		t.Errorf("duration sum = %v", dur)
+	}
+	if !strings.Contains(string(a.Raw()), "summarizedExerciseSets") {
+		t.Error("raw must keep the original exercise data")
+	}
+}
+
+func TestActivities_NoExercisesForOtherTypes(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{`{"activityId":1}`, `{"activityId":1,"summarizedExerciseSets":null}`, `{"activityId":1,"summarizedExerciseSets":[]}`} {
+		c, _ := serve(t, "["+body+"]")
+		got, err := c.Activities(context.Background(), garmin.ActivitiesOptions{})
+		if err != nil || len(got) != 1 || len(got[0].Exercises) != 0 {
+			t.Errorf("body %s: %+v err %v", body, got, err)
+		}
+	}
+}
+
+func TestActivities_ExerciseWithBadTypesFails(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `[{"activityId":1,"summarizedExerciseSets":[{"reps":"many"}]}]`)
+	if _, err := c.Activities(context.Background(), garmin.ActivitiesOptions{}); err == nil {
+		t.Error("expected decode error")
+	}
+}
+
+func TestExerciseSummary_MarshalsFriendlyUnits(t *testing.T) {
+	t.Parallel()
+	b, err := json.Marshal(garmin.ExerciseSummary{Category: "SQUAT", Sets: 4, Reps: 60, MaxWeightKg: 30, VolumeKg: 1800, DurationSeconds: 291})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"category":"SQUAT","sets":4,"reps":60,"maxWeightKg":30,"volumeKg":1800,"durationSeconds":291}`
+	if string(b) != want {
+		t.Errorf("json = %s\nwant   %s", b, want)
+	}
+}
+
+func TestActivityDetail_StrengthTotals(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `{"activityId":5,"activityTypeDTO":{"typeKey":"strength_training"},
+	  "summaryDTO":{"activeSets":26,"totalSets":26,"totalExerciseReps":341,"duration":4003.8}}`)
+	d, err := c.ActivityDetail(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Summary.ActiveSets != 26 || d.Summary.TotalSets != 26 || d.Summary.TotalReps != 341 {
+		t.Errorf("summary = %+v", d.Summary)
+	}
+}
+
+// Invariants against the local, git-ignored capture of a real strength
+// session (see TestLiveStoreActivity); skipped when absent.
+func TestActivities_LocalRealStrengthInvariants(t *testing.T) {
+	t.Parallel()
+	b, err := os.ReadFile(filepath.Join("testdata", "live", "strength_list_entry.json"))
+	if err != nil {
+		t.Skip("no local strength capture")
+	}
+	c, _ := serve(t, "["+string(b)+"]")
+	got, err := c.Activities(context.Background(), garmin.ActivitiesOptions{})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	a := got[0]
+	var sets, reps int
+	var dur float64
+	for _, e := range a.Exercises {
+		sets += e.Sets
+		reps += e.Reps
+		dur += e.DurationSeconds
+		if e.Reps > 0 && e.MaxWeightKg > 0 && e.VolumeKg > float64(e.Reps)*e.MaxWeightKg+1e-6 {
+			t.Errorf("%s: volume %v kg exceeds reps*maxWeight %v", e.Category, e.VolumeKg, float64(e.Reps)*e.MaxWeightKg)
+		}
+	}
+	if len(a.Exercises) == 0 || sets != a.TotalSets || reps != a.TotalReps {
+		t.Errorf("%d exercises: sums %d sets / %d reps vs totals %d / %d", len(a.Exercises), sets, reps, a.TotalSets, a.TotalReps)
+	}
+	if !near(dur, a.MovingDuration, 1) {
+		t.Errorf("exercise time %v s != moving duration %v s", dur, a.MovingDuration)
+	}
+}
+
+func TestActivities_QueryFromSwaggerOptions(t *testing.T) {
+	t.Parallel()
+	yes, no := true, false
+	tests := []struct {
+		name string
+		opts garmin.ActivitiesOptions
+		want url.Values
+	}{
+		{"sorting", garmin.ActivitiesOptions{SortBy: "distance", Ascending: true},
+			url.Values{"start": {"0"}, "limit": {"99"}, "sortBy": {"distance"}, "sortOrder": {"asc"}}},
+		{"descending is Garmin's default so nothing is sent", garmin.ActivitiesOptions{SortBy: "duration"},
+			url.Values{"start": {"0"}, "limit": {"99"}, "sortBy": {"duration"}}},
+		{"search and event type", garmin.ActivitiesOptions{Search: "long run", EventType: "race"},
+			url.Values{"start": {"0"}, "limit": {"99"}, "search": {"long run"}, "eventType": {"race"}}},
+		{"favorites only", garmin.ActivitiesOptions{Favorite: &yes},
+			url.Values{"start": {"0"}, "limit": {"99"}, "favorite": {"1"}}},
+		{"non-favorites only", garmin.ActivitiesOptions{Favorite: &no},
+			url.Values{"start": {"0"}, "limit": {"99"}, "favorite": {"0"}}},
+		{"include child activities", garmin.ActivitiesOptions{IncludeChildren: true},
+			url.Values{"start": {"0"}, "limit": {"99"}, "excludeChildren": {"false"}}},
+		{"repeated array params", garmin.ActivitiesOptions{ExcludedSubTypes: []string{"treadmill_running", "indoor_cardio"}, RequiredFields: []string{"averageHR", "calories"}},
+			url.Values{"start": {"0"}, "limit": {"99"}, "excludedActivitySubType": {"treadmill_running", "indoor_cardio"}, "requiredField": {"averageHR", "calories"}}},
+		{"ranges", garmin.ActivitiesOptions{MinDistance: 10000, MaxDistance: 21097, MinDuration: 600, MaxDuration: 7200,
+			MinElapsedDuration: 700, MaxElapsedDuration: 8000, MinElevationGain: 50, MaxElevationGain: 900, MinAvgPower: 150},
+			url.Values{"start": {"0"}, "limit": {"99"}, "minDistance": {"10000"}, "maxDistance": {"21097"}, "minDuration": {"600"}, "maxDuration": {"7200"},
+				"minElapsedDuration": {"700"}, "maxElapsedDuration": {"8000"}, "minElevation": {"50"}, "maxElevation": {"900"}, "minAvgPower": {"150"}}},
+		{"one-sided range", garmin.ActivitiesOptions{MinDistance: 5000},
+			url.Values{"start": {"0"}, "limit": {"99"}, "minDistance": {"5000"}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, last := serve(t, "[]")
+			if _, err := c.Activities(context.Background(), tc.opts); err != nil {
+				t.Fatal(err)
+			}
+			if got := last.URL.Query(); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("query = %v\nwant    %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestActivities_InvalidRangeOptions(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, "[]")
+	for name, o := range map[string]garmin.ActivitiesOptions{
+		"distance min>max":  {MinDistance: 10, MaxDistance: 5},
+		"duration min>max":  {MinDuration: 10, MaxDuration: 5},
+		"elapsed min>max":   {MinElapsedDuration: 10, MaxElapsedDuration: 5},
+		"elevation min>max": {MinElevationGain: 10, MaxElevationGain: 5},
+		"negative distance": {MinDistance: -1},
+		"negative duration": {MaxDuration: -1},
+		"negative power":    {MinAvgPower: -1},
+	} {
+		if _, err := c.Activities(context.Background(), o); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+}
+
+func TestActivities_ElevationFieldsAndNoDataSentinel(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `[
+	  {"activityId":1,"activityType":{"typeKey":"running"},"avgElevation":110.2,"minElevation":100.6,"maxElevation":122.8,"elevationGain":125,"elevationLoss":124.5},
+	  {"activityId":2,"activityType":{"typeKey":"strength_training"},"avgElevation":-500.0},
+	  {"activityId":3,"activityType":{"typeKey":"cycling"},"avgElevation":-20.5,"minElevation":-30,"maxElevation":-10}]`)
+	got, err := c.Activities(context.Background(), garmin.ActivitiesOptions{})
+	if err != nil || len(got) != 3 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	run := got[0]
+	if run.AvgElevation != 110.2 || run.MinElevation != 100.6 || run.MaxElevation != 122.8 || run.ElevationGain != 125 || run.ElevationLoss != 124.5 {
+		t.Errorf("outdoor run elevation = %+v", run.ActivityMetrics)
+	}
+	if st := got[1]; st.AvgElevation != 0 || st.ElevationGain != 0 || st.MinElevation != 0 {
+		t.Errorf("-500 sentinel not mapped to zero: %+v", st.ActivityMetrics)
+	}
+	if !strings.Contains(string(got[1].Raw()), "-500") {
+		t.Error("raw must keep Garmin's original value")
+	}
+	if below := got[2]; below.AvgElevation != -20.5 || below.MinElevation != -30 {
+		t.Errorf("genuine below-sea-level elevations must survive: %+v", below.ActivityMetrics)
+	}
+}
+
+func TestActivityDetail_ElevationFields(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `{"activityId":5,"summaryDTO":{"elevationGain":125,"elevationLoss":124,"minElevation":100.6,"maxElevation":122.8,"avgElevation":110.2}}`)
+	d, err := c.ActivityDetail(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Summary.ElevationGain != 125 || d.Summary.ElevationLoss != 124 || d.Summary.MinElevation != 100.6 || d.Summary.MaxElevation != 122.8 {
+		t.Errorf("summary = %+v", d.Summary)
+	}
+	c2, _ := serve(t, `{"activityId":6,"summaryDTO":{"avgElevation":-500}}`)
+	d2, err := c2.ActivityDetail(context.Background(), 6)
+	if err != nil || d2.Summary.AvgElevation != 0 {
+		t.Errorf("detail sentinel: %+v err %v", d2.Summary, err)
 	}
 }

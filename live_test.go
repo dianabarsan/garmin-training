@@ -276,3 +276,66 @@ func TestLiveTyped(t *testing.T) {
 		t.Logf("BodyBattery: %d days, %d samples", len(bb), samples)
 	}
 }
+
+// TestLiveStoreActivity saves the raw responses for one activity to
+// testdata/live/ (git-ignored: they contain real GPS and health data).
+// It picks the newest activity of type GARMIN_ACTIVITY_TYPE (default
+// "running"), or the one in GARMIN_ACTIVITY_ID.
+//
+//	go test -tags live -run TestLiveStoreActivity -v
+func TestLiveStoreActivity(t *testing.T) {
+	keyFile := os.Getenv("GARMIN_KEY_FILE")
+	if keyFile == "" {
+		keyFile = "key"
+	}
+	key, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Skipf("no key file: %v", err)
+	}
+	c := New(WithTokenSource(auth.NewTokenSource(string(key))))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	typeKey := os.Getenv("GARMIN_ACTIVITY_TYPE")
+	if typeKey == "" {
+		typeKey = "running"
+	}
+	var listEntry json.RawMessage
+	id := os.Getenv("GARMIN_ACTIVITY_ID")
+	if id == "" {
+		acts, err := c.Activities(ctx, ActivitiesOptions{Limit: 1, TypeKey: typeKey})
+		if err != nil || len(acts) == 0 {
+			t.Fatalf("no %q activity found: %v", typeKey, err)
+		}
+		id = strconv.FormatInt(acts[0].ID, 10)
+		listEntry = acts[0].Raw()
+	}
+
+	dir := filepath.Join("testdata", "live")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	save := func(name string, raw json.RawMessage) {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, raw, "", "  "); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), buf.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("saved %-26s %7d bytes", name, buf.Len())
+	}
+	if listEntry != nil {
+		save("activity_list_entry.json", listEntry)
+	}
+	for name, path := range map[string]string{
+		"activity_detail.json":  "/activity-service/activity/" + id,
+		"activity_details.json": "/activity-service/activity/" + id + "/details",
+	} {
+		var raw json.RawMessage
+		if err := c.get(ctx, path, nil, &raw); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		save(name, raw)
+	}
+}

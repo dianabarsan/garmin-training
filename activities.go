@@ -22,26 +22,96 @@ type ActivityType struct {
 // activity detail. Distances are metres, durations seconds, speeds metres per
 // second. Fields Garmin does not report for an activity are zero.
 type ActivityMetrics struct {
-	StartTime             Timestamp `json:"startTimeGMT"`
-	Distance              float64   `json:"distance"`
-	Duration              float64   `json:"duration"`
-	ElapsedDuration       float64   `json:"elapsedDuration"`
-	MovingDuration        float64   `json:"movingDuration"`
-	Calories              float64   `json:"calories"`
-	BMRCalories           float64   `json:"bmrCalories"`
-	AverageHR             float64   `json:"averageHR"`
-	MaxHR                 float64   `json:"maxHR"`
-	MinHR                 float64   `json:"minHR"` // detail only
-	AverageSpeed          float64   `json:"averageSpeed"`
-	AverageMovingSpeed    float64   `json:"averageMovingSpeed"` // detail only
-	AvgElevation          float64   `json:"avgElevation"`
-	Steps                 int       `json:"steps"`
-	AerobicTrainingEffect float64   `json:"aerobicTrainingEffect"`
+	StartTime          Timestamp `json:"startTimeGMT"`
+	Distance           float64   `json:"distance"`
+	Duration           float64   `json:"duration"`
+	ElapsedDuration    float64   `json:"elapsedDuration"`
+	MovingDuration     float64   `json:"movingDuration"`
+	Calories           float64   `json:"calories"`
+	BMRCalories        float64   `json:"bmrCalories"`
+	AverageHR          float64   `json:"averageHR"`
+	MaxHR              float64   `json:"maxHR"`
+	MinHR              float64   `json:"minHR"` // detail only
+	AverageSpeed       float64   `json:"averageSpeed"`
+	AverageMovingSpeed float64   `json:"averageMovingSpeed"` // detail only
+	// Elevation figures are metres. Gain and loss are Garmin's own totals.
+	// Activities without altitude data (indoor, strength, HIIT) report zero
+	// for all of them; Garmin sends -500 for the average, which is mapped to 0.
+	AvgElevation          float64 `json:"avgElevation"`
+	MinElevation          float64 `json:"minElevation"`
+	MaxElevation          float64 `json:"maxElevation"`
+	ElevationGain         float64 `json:"elevationGain"`
+	ElevationLoss         float64 `json:"elevationLoss"`
+	Steps                 int     `json:"steps"`
+	AerobicTrainingEffect float64 `json:"aerobicTrainingEffect"`
 	// AnaerobicTrainingEffect and TrainingLoad are Garmin's own scores.
 	AnaerobicTrainingEffect float64 `json:"anaerobicTrainingEffect"`
 	TrainingLoad            float64 `json:"activityTrainingLoad"`
 	TrainingEffectLabel     string  `json:"trainingEffectLabel"`
 	BodyBatteryChange       int     `json:"differenceBodyBattery"`
+	// Strength totals. TotalReps is "totalReps" in the activity list and
+	// "totalExerciseReps" in the detail response; both land here.
+	ActiveSets int `json:"activeSets"`
+	TotalSets  int `json:"totalSets"`
+	TotalReps  int `json:"totalReps"`
+}
+
+// noElevation is the value Garmin sends where an activity has no altitude data.
+const noElevation = -500
+
+// normalize replaces Garmin's "no data" sentinels with the package's zero value.
+func (m *ActivityMetrics) normalize() {
+	for _, v := range []*float64{&m.AvgElevation, &m.MinElevation, &m.MaxElevation} {
+		if *v == noElevation {
+			*v = 0
+		}
+	}
+}
+
+// ExerciseSummary is one exercise's totals within a strength session. Garmin
+// does not expose individual sets, only these per-exercise sums.
+type ExerciseSummary struct {
+	// Category is Garmin's exercise group, e.g. "SQUAT" or "WARM_UP".
+	Category string `json:"category"`
+	// SubCategory is the specific movement, e.g. "DUMBBELL_FRONT_SQUAT".
+	// It is empty for categories such as WARM_UP.
+	SubCategory string `json:"subCategory,omitempty"`
+	Sets        int    `json:"sets"`
+	Reps        int    `json:"reps"`
+	// MaxWeightKg is the heaviest weight used; 0 for bodyweight or banded work.
+	MaxWeightKg float64 `json:"maxWeightKg"`
+	// VolumeKg is the total weight lifted: the sum of reps times weight.
+	VolumeKg float64 `json:"volumeKg"`
+	// DurationSeconds is time under load. Rest between sets is excluded, so
+	// the exercises add up to the activity's MovingDuration.
+	DurationSeconds float64 `json:"durationSeconds"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler. Garmin sends weights in grams
+// and durations in milliseconds (verified against the session totals).
+func (e *ExerciseSummary) UnmarshalJSON(b []byte) error {
+	var aux struct {
+		Category    string  `json:"category"`
+		SubCategory string  `json:"subCategory"`
+		Sets        int     `json:"sets"`
+		Reps        int     `json:"reps"`
+		MaxWeight   float64 `json:"maxWeight"`
+		Volume      float64 `json:"volume"`
+		Duration    float64 `json:"duration"`
+	}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	*e = ExerciseSummary{
+		Category:        aux.Category,
+		SubCategory:     aux.SubCategory,
+		Sets:            aux.Sets,
+		Reps:            aux.Reps,
+		MaxWeightKg:     aux.MaxWeight / 1000,
+		VolumeKg:        aux.Volume / 1000,
+		DurationSeconds: aux.Duration / 1000,
+	}
+	return nil
 }
 
 // Activity is one entry from the activity list.
@@ -53,6 +123,9 @@ type Activity struct {
 	ActivityMetrics
 	// HRTimeInZone is seconds spent in heart-rate zones 1 to 5.
 	HRTimeInZone [5]float64 `json:"-"`
+	// Exercises is the per-exercise breakdown of a strength session; nil for
+	// other activity types. Only the activity list carries it.
+	Exercises []ExerciseSummary `json:"-"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -65,16 +138,22 @@ func (a *Activity) UnmarshalJSON(b []byte) error {
 		Z3 float64 `json:"hrTimeInZone_3"`
 		Z4 float64 `json:"hrTimeInZone_4"`
 		Z5 float64 `json:"hrTimeInZone_5"`
+
+		Exercises []ExerciseSummary `json:"summarizedExerciseSets"`
 	}{plain: (*plain)(a)}
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
 	a.HRTimeInZone = [5]float64{aux.Z1, aux.Z2, aux.Z3, aux.Z4, aux.Z5}
+	a.Exercises = aux.Exercises
+	a.ActivityMetrics.normalize()
 	return nil
 }
 
-// ActivityDetail is the response for a single activity. Lap, split and
-// time-series data is not modelled; use Raw or DownloadActivity.
+// ActivityDetail is the response for a single activity's summary. Laps and
+// splits are not available from the Personal API (the obvious paths return
+// 404). Per-sample metrics and the GPS track exist at
+// /activity-service/activity/{id}/details but are not wrapped yet.
 type ActivityDetail struct {
 	rawJSON
 	ID       int64
@@ -92,7 +171,8 @@ func (d *ActivityDetail) UnmarshalJSON(b []byte) error {
 		Type    ActivityType `json:"activityTypeDTO"`
 		Summary struct {
 			ActivityMetrics
-			TrainingEffect float64 `json:"trainingEffect"` // detail's name for the aerobic score
+			TrainingEffect    float64 `json:"trainingEffect"`    // detail's name for the aerobic score
+			TotalExerciseReps int     `json:"totalExerciseReps"` // detail's name for totalReps
 		} `json:"summaryDTO"`
 		TimeZone struct {
 			TimeZone string `json:"timeZone"`
@@ -103,24 +183,74 @@ func (d *ActivityDetail) UnmarshalJSON(b []byte) error {
 	}
 	d.ID, d.Name, d.Type = aux.ID, aux.Name, aux.Type
 	d.Summary = aux.Summary.ActivityMetrics
+	d.Summary.normalize()
 	if d.Summary.AerobicTrainingEffect == 0 {
 		d.Summary.AerobicTrainingEffect = aux.Summary.TrainingEffect
+	}
+	if d.Summary.TotalReps == 0 {
+		d.Summary.TotalReps = aux.Summary.TotalExerciseReps
 	}
 	d.TimeZone = aux.TimeZone.TimeZone
 	return nil
 }
 
-// ActivitiesOptions filters and pages the activity list. The zero value
-// returns the 20 most recent activities.
+// ActivitiesOptions filters, sorts and pages the activity list. The zero value
+// returns the 99 most recent activities (Garmin's own defaults). Zero-valued
+// filters are omitted, so a bound of 0 means "no bound".
 type ActivitiesOptions struct {
-	// Start is the offset into the result list (0 = newest).
+	// Start is the offset into the result list (0 = first).
 	Start int
-	// Limit is the page size. Defaults to 20.
+	// Limit is the page size. Defaults to 99.
 	Limit int
-	// StartDate and EndDate bound activities by date when non-zero.
+
+	// StartDate and EndDate bound activities by local start date, inclusive.
 	StartDate, EndDate time.Time
-	// TypeKey filters by parent activity type key (see ActivityTypeKeys).
+
+	// TypeKey filters by parent activity type, e.g. "running", "cycling" or
+	// "fitness_equipment". Child types such as "strength_training" are
+	// rejected by Garmin with HTTP 400; use SubTypeKey for those.
 	TypeKey string
+	// SubTypeKey filters by child activity type, e.g. "strength_training" or
+	// "trail_running". Parent types are rejected with HTTP 400. When TypeKey is
+	// also set, the child must belong to that parent.
+	SubTypeKey string
+	// ExcludedSubTypes drops activities of these child types.
+	ExcludedSubTypes []string
+	// EventType filters by event classification: race, training, recreation,
+	// fitness, specialEvent or uncategorized. Garmin does not validate it: a
+	// value no activity has (activities are often all "uncategorized") returns
+	// an empty list, not an error.
+	EventType string
+
+	// Search matches activity names and descriptions.
+	Search string
+	// Favorite filters on favorite status; nil applies no filter.
+	Favorite *bool
+	// IncludeChildren includes child activities such as the legs of a
+	// multisport activity, which Garmin excludes by default.
+	IncludeChildren bool
+
+	// SortBy names the field to sort by, such as "name", "distance" or
+	// "duration". Defaults to the local start time.
+	SortBy string
+	// Ascending sorts oldest/smallest first. Garmin sorts descending by default.
+	Ascending bool
+
+	// Range filters. Distances and elevation are metres, durations seconds
+	// (MinDuration/MaxDuration use the timer; the Elapsed variants include
+	// paused time), power is watts. Elevation is total gain.
+	MinDistance, MaxDistance               int64
+	MinDuration, MaxDuration               int64
+	MinElapsedDuration, MaxElapsedDuration int64
+	MinElevationGain, MaxElevationGain     int64
+	MinAvgPower                            int64
+
+	// RequiredFields lists activity fields that must be non-null for an
+	// activity to be included. Names follow Garmin's search vocabulary, which
+	// does not always match the response JSON: "avgHr" works while the
+	// response key "averageHR" matches nothing. Unrecognised names are not an
+	// error, they silently match no activities, so check results when using this.
+	RequiredFields []string
 }
 
 func (o ActivitiesOptions) query() (url.Values, error) {
@@ -129,12 +259,13 @@ func (o ActivitiesOptions) query() (url.Values, error) {
 	}
 	limit := o.Limit
 	if limit == 0 {
-		limit = 20
+		limit = 99
 	}
 	q := url.Values{
 		"start": {strconv.Itoa(o.Start)},
 		"limit": {strconv.Itoa(limit)},
 	}
+
 	if !o.StartDate.IsZero() {
 		q.Set("startDate", dateParam(o.StartDate))
 	}
@@ -146,13 +277,70 @@ func (o ActivitiesOptions) query() (url.Values, error) {
 			return nil, err
 		}
 	}
-	if o.TypeKey != "" {
-		q.Set("activityType", o.TypeKey)
+
+	setStr := func(key, v string) {
+		if v != "" {
+			q.Set(key, v)
+		}
+	}
+	setStr("activityType", o.TypeKey)
+	setStr("activitySubType", o.SubTypeKey)
+	setStr("eventType", o.EventType)
+	setStr("search", o.Search)
+	setStr("sortBy", o.SortBy)
+	for _, k := range o.ExcludedSubTypes {
+		q.Add("excludedActivitySubType", k)
+	}
+	for _, f := range o.RequiredFields {
+		q.Add("requiredField", f)
+	}
+	if o.Ascending {
+		q.Set("sortOrder", "asc")
+	}
+	if o.IncludeChildren {
+		q.Set("excludeChildren", "false")
+	}
+	if o.Favorite != nil {
+		if *o.Favorite {
+			q.Set("favorite", "1")
+		} else {
+			q.Set("favorite", "0")
+		}
+	}
+
+	ranges := []struct {
+		minKey, maxKey string
+		lo, hi         int64
+	}{
+		{"minDistance", "maxDistance", o.MinDistance, o.MaxDistance},
+		{"minDuration", "maxDuration", o.MinDuration, o.MaxDuration},
+		{"minElapsedDuration", "maxElapsedDuration", o.MinElapsedDuration, o.MaxElapsedDuration},
+		{"minElevation", "maxElevation", o.MinElevationGain, o.MaxElevationGain},
+	}
+	for _, r := range ranges {
+		if r.lo < 0 || r.hi < 0 {
+			return nil, fmt.Errorf("garmin: negative %s/%s", r.minKey, r.maxKey)
+		}
+		if r.lo > 0 && r.hi > 0 && r.lo > r.hi {
+			return nil, fmt.Errorf("garmin: %s (%d) exceeds %s (%d)", r.minKey, r.lo, r.maxKey, r.hi)
+		}
+		if r.lo > 0 {
+			q.Set(r.minKey, strconv.FormatInt(r.lo, 10))
+		}
+		if r.hi > 0 {
+			q.Set(r.maxKey, strconv.FormatInt(r.hi, 10))
+		}
+	}
+	if o.MinAvgPower < 0 {
+		return nil, fmt.Errorf("garmin: negative minAvgPower")
+	}
+	if o.MinAvgPower > 0 {
+		q.Set("minAvgPower", strconv.FormatInt(o.MinAvgPower, 10))
 	}
 	return q, nil
 }
 
-// Activities returns one page of activities, newest first.
+// Activities returns one page of activities, newest first unless opts sorts otherwise.
 func (c *Client) Activities(ctx context.Context, opts ActivitiesOptions) ([]Activity, error) {
 	q, err := opts.query()
 	if err != nil {
@@ -211,8 +399,10 @@ func (c *Client) ActivityDetail(ctx context.Context, id int64) (ActivityDetail, 
 	return d, nil
 }
 
-// ActivityTypeKeys returns the activity type keys usable in
-// ActivitiesOptions.TypeKey.
+// ActivityTypeKeys returns every activity type key Garmin knows, parents and
+// children together. The list does not say which is which: parent keys (such
+// as "running") go in ActivitiesOptions.TypeKey and child keys (such as
+// "trail_running") in ActivitiesOptions.SubTypeKey.
 func (c *Client) ActivityTypeKeys(ctx context.Context) ([]string, error) {
 	var items []struct {
 		Key string `json:"key"`
