@@ -27,7 +27,7 @@ func securityHeaders(h http.Header) {
 }
 
 // requireToken demands "Authorization: Bearer <token>" when token is set.
-func requireToken(token string, next http.Handler) http.Handler {
+func requireToken(token string, audit *slog.Logger, next http.Handler) http.Handler {
 	if token == "" {
 		return next
 	}
@@ -35,6 +35,11 @@ func requireToken(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			reason := "invalid_token"
+			if r.Header.Get("Authorization") == "" {
+				reason = "missing_token"
+			}
+			auditDenied(audit, r, reason) // never records what was presented
 			w.Header().Set("WWW-Authenticate", `Bearer realm="garmin-mcp"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -47,7 +52,7 @@ func requireToken(token string, next http.Handler) http.Handler {
 // loopback-bound server against DNS rebinding, where a hostile web page makes
 // the browser send requests to localhost under an attacker-controlled name.
 // A nil or empty allowed set disables the check.
-func hostGuard(allowed []string, next http.Handler) http.Handler {
+func hostGuard(allowed []string, audit *slog.Logger, next http.Handler) http.Handler {
 	if len(allowed) == 0 {
 		return next
 	}
@@ -61,6 +66,7 @@ func hostGuard(allowed []string, next http.Handler) http.Handler {
 			host = h
 		}
 		if !set[strings.ToLower(strings.Trim(host, "[]"))] {
+			auditDenied(audit, r, "forbidden_host", slog.String("host", truncate(r.Host, maxAuditField)))
 			http.Error(w, "forbidden host", http.StatusForbidden)
 			return
 		}
@@ -92,14 +98,14 @@ type authResponse struct {
 
 // authHandler serves /auth: GET reports status, POST provides a key, DELETE
 // forgets it. It never returns or logs the key.
-func authHandler(creds *Credentials, log *slog.Logger) http.Handler {
+func authHandler(creds *Credentials, log, audit *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		securityHeaders(w.Header())
 		switch r.Method {
 		case http.MethodGet, http.MethodHead:
 			writeJSON(w, http.StatusOK, authResponse{Status: creds.Status()})
 		case http.MethodPost:
-			setKey(w, r, creds, log)
+			setKey(w, r, creds, log, audit)
 		case http.MethodDelete:
 			if err := creds.Clear(); err != nil {
 				log.Error("clearing key failed", "err", err)
@@ -107,6 +113,7 @@ func authHandler(creds *Credentials, log *slog.Logger) http.Handler {
 				return
 			}
 			log.Info("API key cleared")
+			audit.LogAttrs(r.Context(), slog.LevelInfo, "key_cleared", remoteAttrs(r)...)
 			writeJSON(w, http.StatusOK, authResponse{Status: creds.Status(), Message: "key removed"})
 		default:
 			w.Header().Set("Allow", "GET, POST, DELETE")
@@ -115,7 +122,7 @@ func authHandler(creds *Credentials, log *slog.Logger) http.Handler {
 	})
 }
 
-func setKey(w http.ResponseWriter, r *http.Request, creds *Credentials, log *slog.Logger) {
+func setKey(w http.ResponseWriter, r *http.Request, creds *Credentials, log, audit *slog.Logger) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxAuthBody)
 	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 
@@ -151,6 +158,7 @@ func setKey(w http.ResponseWriter, r *http.Request, creds *Credentials, log *slo
 		switch {
 		case errors.Is(err, auth.ErrInvalidKey):
 			log.Warn("API key rejected by Garmin")
+			audit.LogAttrs(r.Context(), slog.LevelWarn, "key_rejected", remoteAttrs(r)...)
 			respondAuth(w, creds, form, http.StatusUnauthorized, "Garmin rejected that key. Create a new one at connect.garmin.com/app/settings/personalApiToken")
 		case errors.Is(err, auth.ErrMalformedToken):
 			respondAuth(w, creds, form, http.StatusBadGateway, "Garmin answered, but not with an access token")
@@ -158,11 +166,13 @@ func setKey(w http.ResponseWriter, r *http.Request, creds *Credentials, log *slo
 			// Network trouble or a failure saving the key; details are logged,
 			// never sent back (they could reveal paths).
 			log.Error("setting API key failed", "err", err)
+			audit.LogAttrs(r.Context(), slog.LevelWarn, "key_set_failed", remoteAttrs(r)...)
 			respondAuth(w, creds, form, http.StatusBadGateway, "could not validate the key with Garmin; try again")
 		}
 		return
 	}
 	log.Info("API key accepted")
+	audit.LogAttrs(r.Context(), slog.LevelInfo, "key_set", remoteAttrs(r)...)
 	respondAuth(w, creds, form, http.StatusOK, "key accepted")
 }
 

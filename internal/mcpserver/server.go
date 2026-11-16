@@ -59,6 +59,9 @@ type Config struct {
 	AllowedHosts []string
 	// Logger receives operational logs, never keys or request bodies.
 	Logger *slog.Logger
+	// Audit receives the audit trail: tool calls, refused requests and key
+	// changes. When nil, audit records go to Logger tagged audit=true.
+	Audit *slog.Logger
 	// Now returns the current time; defaults to time.Now.
 	Now func() time.Time
 	// Version is reported to MCP clients.
@@ -71,6 +74,7 @@ type Server struct {
 	creds        *Credentials
 	log          *slog.Logger
 	now          func() time.Time
+	audit        *slog.Logger
 	authEndpoint bool // whether /auth and the key page are served
 
 	mcp     *mcp.Server
@@ -93,19 +97,30 @@ func New(cfg Config) (*Server, error) {
 	if s.now == nil {
 		s.now = time.Now
 	}
+	s.audit = cfg.Audit
+	if s.audit == nil {
+		s.audit = s.log.With("audit", true)
+	}
 	version := cfg.Version
 	if version == "" {
 		version = "dev"
 	}
 
 	s.mcp = mcp.NewServer(&mcp.Implementation{Name: "garmin-mcp", Title: "Garmin Connect (personal)", Version: version},
-		&mcp.ServerOptions{Instructions: s.instructions()})
+		&mcp.ServerOptions{Instructions: s.instructions(), InitializedHandler: s.auditConnected})
+	s.mcp.AddReceivingMiddleware(s.auditMiddleware())
 	s.registerTools()
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp },
 		&mcp.StreamableHTTPOptions{SessionTimeout: 30 * time.Minute})
 
 	protect := http.NewCrossOriginProtection()
+	protect.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auditDenied(s.audit, r, "cross_origin",
+			slog.String("origin", truncate(r.Header.Get("Origin"), maxAuditField)),
+			slog.String("sec_fetch_site", truncate(r.Header.Get("Sec-Fetch-Site"), maxAuditField)))
+		http.Error(w, "cross-origin request refused", http.StatusForbidden)
+	}))
 	allowed, err := normalizeHosts(cfg.AllowedHosts)
 	if err != nil {
 		return nil, err
@@ -118,9 +133,9 @@ func New(cfg Config) (*Server, error) {
 		hosts = LoopbackHosts
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", requireToken(cfg.Token, protect.Handler(mcpHandler)))
+	mux.Handle("/mcp", requireToken(cfg.Token, s.audit, protect.Handler(mcpHandler)))
 	if s.authEndpoint {
-		mux.Handle("/auth", requireToken(cfg.Token, protect.Handler(authHandler(s.creds, s.log))))
+		mux.Handle("/auth", requireToken(cfg.Token, s.audit, protect.Handler(authHandler(s.creds, s.log, s.audit))))
 		if cfg.Token == "" {
 			mux.Handle("/", protect.Handler(indexHandler(s.creds)))
 		}
@@ -129,7 +144,7 @@ func New(cfg Config) (*Server, error) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	s.handler = hostGuard(hosts, mux)
+	s.handler = hostGuard(hosts, s.audit, mux)
 	return s, nil
 }
 

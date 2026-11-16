@@ -56,6 +56,7 @@ with mode `0600` in a `0700` directory); `DELETE /auth` removes it.
 | `-token` / `GARMIN_MCP_TOKEN` | Require `Authorization: Bearer <token>` on `/mcp` and `/auth`. |
 | `-allowed-host` / `GARMIN_MCP_ALLOWED_HOSTS` | Public hostname(s), comma separated, that the server may be reached as. Set it behind a reverse proxy; other `Host` values are refused. |
 | `-disable-auth-endpoint` / `GARMIN_MCP_DISABLE_AUTH_ENDPOINT` | Serve no `/auth` or key page (both answer 404), so a leaked token can never replace the key. The key must then come from `GARMIN_PERSONAL_API_KEY[_FILE]` or an existing `-key-store`; the server refuses to start without one. Use it whenever the server is reachable from outside. |
+| `-audit-log` / `GARMIN_MCP_AUDIT_LOG` | Append the audit trail (see below) to this file as JSON lines, mode `0600`. Without it the records appear in the normal log, tagged `audit=true`. |
 | `-key-store` / `GARMIN_MCP_KEY_STORE` | Persist the key in this file. |
 | `GARMIN_PERSONAL_API_KEY` | Key to use at startup (wins over the key store). |
 | `GARMIN_MCP_TOKEN_FILE`, `GARMIN_PERSONAL_API_KEY_FILE` | Read the token / key from a file instead (Docker secrets); setting both forms of one is an error. |
@@ -83,6 +84,47 @@ built for a single user on one machine:
   speaks plain HTTP. **[`deploy/`](deploy/README.md) has a ready-to-run setup** (Docker
   Compose with Caddy and automatic HTTPS, exposing only `/mcp`) for reaching it from your
   phone.
+
+### Audit log
+
+The server records who asked for what, and who was turned away, so you can tell what was
+read if a token ever leaks.
+
+| Event | When | Main fields |
+|---|---|---|
+| `tool_call` | A tool was called | `tool`, `args`, `outcome` (`ok` or `error`), `error`, `duration_ms`, `result_bytes`, `client`, `session` |
+| `client_connected` | A client finished the MCP handshake over HTTP | `client`, `session` |
+| `access_denied` | A request was refused | `reason` (`missing_token`, `invalid_token`, `forbidden_host`, `cross_origin`), `method`, `path`, `remote`, `forwarded_for`, `user_agent`, plus the `host` or `origin` that was rejected |
+| `key_set`, `key_rejected`, `key_set_failed`, `key_cleared` | The Garmin key was provided, refused, failed to validate, or removed at `/auth` | `remote`, `forwarded_for` |
+
+Records go into the normal log tagged `audit=true`, or, with `-audit-log path`, into a
+separate append-only file of JSON lines (mode `0600`). Useful filters:
+
+```sh
+grep audit=true server.log                                       # the normal log
+jq -c 'select(.msg=="access_denied")' audit.log                  # who was refused
+jq -c 'select(.msg=="tool_call") | {time, tool, args, client}' audit.log
+```
+
+**Never recorded:** the Garmin key, the bearer token (neither the real one nor one a client
+presented), or any data a tool returned. `result_bytes` says how much came back, not what.
+
+**What is recorded about requests:** tool arguments are logged because they say what was
+read (a date range, an activity id). They can contain free text such as a search term, so
+keep the log as private as the data. Values are cut to a fixed length and cannot span
+lines. `session` is a short hash of the MCP session id, enough to follow one client's
+calls without exposing an identifier that could be replayed.
+
+**Limits:**
+
+- Behind a reverse proxy, `remote` is the proxy's address. `forwarded_for` is the
+  `X-Forwarded-For` header exactly as received and a client can forge it, so treat it as a
+  hint.
+- It is a plain file: not rotated (use `logrotate` or similar) and not tamper-evident
+  against someone who can write to it.
+- A `tool_call` is written when the call finishes, so a call that never returns leaves no
+  record.
+- `client_connected` is only emitted for HTTP clients, which is how real clients connect.
 
 ### Tools
 

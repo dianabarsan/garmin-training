@@ -10,6 +10,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -48,6 +49,7 @@ type config struct {
 	token        string
 	allowedHosts []string
 	keyStore     string
+	auditLog     string
 	garminURL    string
 	logLevel     string
 	envKey       string // initial API key from GARMIN_PERSONAL_API_KEY[_FILE]
@@ -76,7 +78,12 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	if err != nil {
 		return err
 	}
-	creds, srv, err := newServer(cfg, log)
+	audit, closeAudit, err := newAuditLogger(cfg.auditLog, log)
+	if err != nil {
+		return err
+	}
+	defer closeAudit()
+	creds, srv, err := newServer(cfg, log, audit)
 	if err != nil {
 		return err
 	}
@@ -92,7 +99,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		return err
 	}
 	bound := ln.Addr().String()
-	log.Info("listening", "addr", bound, "mcp", "/mcp", "auth_endpoint", !cfg.disableAuth, "token_required", cfg.token != "", "key_loaded", creds.Status().Authenticated)
+	log.Info("listening", "addr", bound, "mcp", "/mcp", "auth_endpoint", !cfg.disableAuth, "audit_log", cmp.Or(cfg.auditLog, "(in this log, audit=true)"), "token_required", cfg.token != "", "key_loaded", creds.Status().Authenticated)
 	if !creds.Status().Authenticated && !cfg.disableAuth {
 		log.Info("no API key yet: open the address in a browser, or POST {\"api_key\": \"...\"} to /auth")
 	}
@@ -129,6 +136,7 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.BoolVar(&cfg.disableAuth, "disable-auth-endpoint", disableDefault, "do not serve /auth or the key page (both answer 404), so the key can only come from GARMIN_PERSONAL_API_KEY[_FILE] or -key-store; use it when the server is reachable from outside (env GARMIN_MCP_DISABLE_AUTH_ENDPOINT)")
 	fs.BoolVar(&cfg.healthcheck, "healthcheck", false, "probe a running server at -addr and exit 0 if it is healthy (for container health checks)")
 	fs.StringVar(&cfg.keyStore, "key-store", getenv("GARMIN_MCP_KEY_STORE"), "file in which to keep the API key between restarts, mode 0600 (env GARMIN_MCP_KEY_STORE); the key stays in memory only when unset")
+	fs.StringVar(&cfg.auditLog, "audit-log", getenv("GARMIN_MCP_AUDIT_LOG"), "append the audit trail (tool calls, refused requests, key changes) to this file as JSON lines, mode 0600; without it the records appear in the normal log tagged audit=true (env GARMIN_MCP_AUDIT_LOG)")
 	fs.StringVar(&cfg.garminURL, "garmin-url", getenv("GARMIN_PERSONAL_API_BASE_URL"), "Garmin API base URL; for testing")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
@@ -152,8 +160,31 @@ func newLogger(level string, w io.Writer) (*slog.Logger, error) {
 	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl})), nil
 }
 
+// newAuditLogger returns the logger for the audit trail and a function that
+// closes it. With a path, records are appended to that file as JSON lines (the
+// file is created mode 0600, its directory 0700). Without one they go to the
+// normal log tagged audit=true.
+func newAuditLogger(path string, ops *slog.Logger) (*slog.Logger, func(), error) {
+	if path == "" {
+		return ops.With("audit", true), func() {}, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("-audit-log: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		return nil, nil, fmt.Errorf("-audit-log: %w", err)
+	}
+	f, err := os.OpenFile(abs, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("-audit-log: %w", err)
+	}
+	logger := slog.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return logger, func() { _ = f.Close() }, nil
+}
+
 // newServer wires the credentials, the Garmin client and the MCP server.
-func newServer(cfg config, log *slog.Logger) (*mcpserver.Credentials, *mcpserver.Server, error) {
+func newServer(cfg config, log, audit *slog.Logger) (*mcpserver.Credentials, *mcpserver.Server, error) {
 	credOpts := []mcpserver.CredentialsOption{}
 	if cfg.garminURL != "" {
 		credOpts = append(credOpts, mcpserver.WithAuthBaseURL(cfg.garminURL))
@@ -179,6 +210,7 @@ func newServer(cfg config, log *slog.Logger) (*mcpserver.Credentials, *mcpserver
 		AllowedHosts:        cfg.allowedHosts,
 		DisableAuthEndpoint: cfg.disableAuth,
 		Logger:              log,
+		Audit:               audit,
 		Version:             version,
 	})
 	if err != nil {

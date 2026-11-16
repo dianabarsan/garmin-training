@@ -116,6 +116,15 @@ Extra settings (for example `GARMIN_MCP_TOKEN=...`) go in `~/.config/garmin-mcp/
 service can read its binary and write only `~/.config/garmin-mcp`. The state directory
 must exist before the service starts, which is why the command above creates it.
 
+To keep a separate audit file (who called which tool, and every refused request; see the
+README), add `-audit-log %h/.config/garmin-mcp/audit.log` to `ExecStart` in the unit. That
+path is inside the one directory the sandbox lets the service write to. Without it the
+records appear in the journal, tagged `audit=true`:
+
+```sh
+journalctl --user -u garmin-mcp | grep audit=true
+```
+
 On macOS this unit does not apply; run the binary in a terminal, or write a launchd
 agent (not covered or tested here).
 

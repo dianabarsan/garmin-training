@@ -121,6 +121,13 @@ in the conversation.
   The key then comes only from `secrets/garmin_key`, the admin port is no longer useful,
   and rotating the key means replacing that file and restarting. This variant has not been
   run through the full Compose test.
+- **Audit trail:** the server records every tool call and every refused request (wrong or
+  missing token, wrong hostname, cross-origin attempts), never the key, the token or any
+  data. See the audit section of the main README. Read it with
+  `docker compose logs garmin-mcp | grep audit=true`. Behind Caddy the address logged as
+  `remote` is Caddy's, so a client's real address is only a hint in `forwarded_for`. To keep
+  a separate file, add `"-audit-log", "/data/audit.log"` to the service's `command` (the
+  `/data` volume is already writable); it is not rotated.
 - **What the server refuses:** requests for any hostname other than yours, any request
   without the token, and (at Caddy) every path except `/mcp`.
 - **Garmin's terms:** the Personal API is for your own data only. Do not share this
