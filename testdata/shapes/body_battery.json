@@ -1,0 +1,45 @@
+[
+  {
+    "bodyBatteryActivityEvent": [
+      {
+        "bodyBatteryImpact": 1,
+        "durationInMilliseconds": 1,
+        "eventStartTimeGmt": "",
+        "eventType": "",
+        "feedbackType": "",
+        "shortFeedback": "",
+        "timezoneOffset": 1
+      }
+    ],
+    "bodyBatteryDynamicFeedbackEvent": {
+      "bodyBatteryLevel": "",
+      "eventTimestampGmt": "",
+      "feedbackLongType": "",
+      "feedbackShortType": ""
+    },
+    "bodyBatteryValueDescriptorDTOList": [
+      {
+        "bodyBatteryValueDescriptorIndex": 1,
+        "bodyBatteryValueDescriptorKey": ""
+      }
+    ],
+    "bodyBatteryValuesArray": [
+      [
+        1
+      ]
+    ],
+    "charged": 1,
+    "date": "",
+    "drained": 1,
+    "endOfDayBodyBatteryDynamicFeedbackEvent": {
+      "bodyBatteryLevel": "",
+      "eventTimestampGmt": "",
+      "feedbackLongType": "",
+      "feedbackShortType": ""
+    },
+    "endTimestampGMT": "",
+    "endTimestampLocal": "",
+    "startTimestampGMT": "",
+    "startTimestampLocal": ""
+  }
+]

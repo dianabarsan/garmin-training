@@ -1,0 +1,33 @@
+{
+  "endTimestampGMT": "",
+  "endTimestampLocal": "",
+  "hrvReadings": [
+    {
+      "hrvValue": 1,
+      "readingTimeGMT": "",
+      "readingTimeLocal": ""
+    }
+  ],
+  "hrvSummary": {
+    "baseline": {
+      "balancedLow": 1,
+      "balancedUpper": 1,
+      "lowUpper": 1,
+      "markerValue": 0.5
+    },
+    "calendarDate": "",
+    "createTimeStamp": "",
+    "feedbackPhrase": "",
+    "lastNight5MinHigh": 1,
+    "lastNightAvg": 1,
+    "status": "",
+    "weeklyAvg": 1
+  },
+  "sleepEndTimestampGMT": "",
+  "sleepEndTimestampLocal": "",
+  "sleepStartTimestampGMT": "",
+  "sleepStartTimestampLocal": "",
+  "startTimestampGMT": "",
+  "startTimestampLocal": "",
+  "userProfilePk": 1
+}

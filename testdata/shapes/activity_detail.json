@@ -1,0 +1,91 @@
+{
+  "accessControlRuleDTO": {
+    "typeId": 1,
+    "typeKey": ""
+  },
+  "activityId": 1,
+  "activityName": "",
+  "activityTypeDTO": {
+    "parentTypeId": 1,
+    "typeId": 1,
+    "typeKey": ""
+  },
+  "activityUUID": {
+    "uuid": ""
+  },
+  "eventTypeDTO": {
+    "typeId": 1,
+    "typeKey": ""
+  },
+  "isMultiSportParent": false,
+  "metadataDTO": {
+    "activityImages": [],
+    "autoCalcCalories": false,
+    "calendarEventInfo": null,
+    "childActivityTypes": [],
+    "childIds": [],
+    "elevationCorrected": false,
+    "favorite": false,
+    "fileFormat": {
+      "formatId": 1,
+      "formatKey": ""
+    },
+    "gcj02": false,
+    "hasMultiDayActivities": false,
+    "hasRunPowerWindData": null,
+    "isOriginal": false,
+    "lapCount": 1,
+    "lastUpdateDate": "",
+    "manualActivity": false,
+    "manufacturer": "",
+    "personalRecord": false,
+    "runPowerWindDataEnabled": null,
+    "sensors": null,
+    "trimmed": false,
+    "uploadedDate": "",
+    "userInfoDto": {
+      "displayname": "",
+      "fullname": "",
+      "profileImageUrlLarge": "",
+      "profileImageUrlMedium": "",
+      "profileImageUrlSmall": "",
+      "userPro": false,
+      "userProfilePk": 1
+    },
+    "videoUrl": null
+  },
+  "summaryDTO": {
+    "activeSets": 1,
+    "activityTrainingLoad": 0.5,
+    "aerobicTrainingEffectMessage": "",
+    "anaerobicTrainingEffect": 0.5,
+    "anaerobicTrainingEffectMessage": "",
+    "averageHR": 0.5,
+    "averageMovingSpeed": 0.5,
+    "averageSpeed": 0.5,
+    "avgElevation": 0.5,
+    "bmrCalories": 0.5,
+    "calories": 0.5,
+    "differenceBodyBattery": 1,
+    "distance": 0.5,
+    "duration": 0.5,
+    "elapsedDuration": 0.5,
+    "maxHR": 0.5,
+    "minActivityLapDuration": 0.5,
+    "minHR": 0.5,
+    "movingDuration": 0.5,
+    "packWeightCalories": 1,
+    "startTimeGMT": "",
+    "startTimeLocal": "",
+    "steps": 1,
+    "totalExerciseReps": 1,
+    "totalSets": 1,
+    "trainingEffect": 0.5,
+    "trainingEffectLabel": "",
+    "waterEstimated": 0.5
+  },
+  "timeZoneUnitDTO": {
+    "timeZone": ""
+  },
+  "userProfileId": 1
+}

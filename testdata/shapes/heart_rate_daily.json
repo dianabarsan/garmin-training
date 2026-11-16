@@ -1,0 +1,23 @@
+{
+  "calendarDate": "",
+  "endTimestampGMT": "",
+  "endTimestampLocal": "",
+  "heartRateValueDescriptors": [
+    {
+      "index": 1,
+      "key": ""
+    }
+  ],
+  "heartRateValues": [
+    [
+      1
+    ]
+  ],
+  "lastSevenDaysAvgRestingHeartRate": 1,
+  "maxHeartRate": 1,
+  "minHeartRate": 1,
+  "restingHeartRate": 1,
+  "startTimestampGMT": "",
+  "startTimestampLocal": "",
+  "userProfilePK": 1
+}

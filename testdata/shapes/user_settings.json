@@ -1,0 +1,58 @@
+{
+  "availableTrainingDays": null,
+  "dateFormat": {
+    "displayFormat": "",
+    "formatId": 1,
+    "formatKey": "",
+    "groupingUsed": false,
+    "maxFraction": 1,
+    "minFraction": 1
+  },
+  "displayName": "",
+  "firstDayOfWeek": {
+    "dayId": 1,
+    "dayName": "",
+    "isPossibleFirstDay": false,
+    "sortOrder": 1
+  },
+  "golfDistanceUnit": "",
+  "golfElevationUnit": null,
+  "golfSpeedUnit": null,
+  "heartRateFormat": {
+    "displayFormat": null,
+    "formatId": 1,
+    "formatKey": "",
+    "groupingUsed": false,
+    "maxFraction": 1,
+    "minFraction": 1
+  },
+  "hydrationContainers": [
+    {
+      "name": null,
+      "unit": "",
+      "volume": 1
+    }
+  ],
+  "hydrationMeasurementUnit": "",
+  "measurementSystem": "",
+  "numberFormat": "",
+  "powerFormat": {
+    "displayFormat": null,
+    "formatId": 1,
+    "formatKey": "",
+    "groupingUsed": false,
+    "maxFraction": 1,
+    "minFraction": 1
+  },
+  "preferredLocale": "",
+  "preferredLongTrainingDays": null,
+  "timeFormat": {
+    "displayFormat": "",
+    "formatId": 1,
+    "formatKey": "",
+    "groupingUsed": false,
+    "maxFraction": 1,
+    "minFraction": 1
+  },
+  "timeZone": ""
+}

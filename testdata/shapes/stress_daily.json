@@ -1,0 +1,12 @@
+[
+  {
+    "calendarDate": "",
+    "values": {
+      "highStressDuration": 1,
+      "lowStressDuration": 1,
+      "mediumStressDuration": 1,
+      "overallStressLevel": 1,
+      "restStressDuration": 1
+    }
+  }
+]

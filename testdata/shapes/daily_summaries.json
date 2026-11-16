@@ -1,0 +1,126 @@
+{
+  "data": [
+    {
+      "bodyBattery": {
+        "activityEvents": [
+          {
+            "bodyBatteryImpact": 1,
+            "deviceId": 1,
+            "durationInMillis": 1,
+            "eventStartTimeGmt": "",
+            "eventStartTimeLocal": "",
+            "eventType": "",
+            "feedbackType": "",
+            "shortFeedback": ""
+          }
+        ],
+        "chargedValue": 1,
+        "drainedValue": 1,
+        "dynamicFeedbackEvent": {
+          "bodyBatteryLevel": "",
+          "eventTimestampGmt": "",
+          "feedbackLongType": "",
+          "feedbackShortType": ""
+        },
+        "endOfDayDynamicFeedbackEvent": {
+          "bodyBatteryLevel": "",
+          "eventTimestampGmt": "",
+          "feedbackLongType": "",
+          "feedbackShortType": ""
+        },
+        "featureVersion": "",
+        "latestValue": 1,
+        "maxValue": 1,
+        "minValue": 1
+      },
+      "calendarDate": "",
+      "calories": {
+        "burnedActive": 1,
+        "burnedResting": 1,
+        "burnedTotal": 1,
+        "consumedGoal": 1,
+        "consumedRemaining": 1
+      },
+      "heartRate": {
+        "maxValue": 1,
+        "minValue": 1,
+        "restingValue": 1
+      },
+      "hydration": {
+        "consumedInFractionalMl": 0.5,
+        "consumedInMl": 1,
+        "goalInFractionalMl": 0.5,
+        "goalInMl": 1
+      },
+      "includesActivityData": false,
+      "includesWellnessData": false,
+      "intensityMinutes": {
+        "goal": 1,
+        "moderate": 1,
+        "vigorous": 1
+      },
+      "jetLag": {},
+      "movement": {
+        "floorsAscended": {
+          "distanceInMeters": 0.5,
+          "goal": 1,
+          "value": 1
+        },
+        "floorsDescended": {
+          "distanceInMeters": 0.5,
+          "value": 1
+        },
+        "pushes": {},
+        "steps": {
+          "distanceInMeters": 0.5,
+          "goal": 1,
+          "value": 1
+        }
+      },
+      "pulseOx": {
+        "avgAltitudeInMeters": 0.5,
+        "avgValue": 1,
+        "latestTimestampGmt": "",
+        "latestTimestampLocal": "",
+        "latestValue": 1,
+        "minValue": 1
+      },
+      "respiration": {
+        "algorithmVersion": 1,
+        "avgValue": 1,
+        "latestTimestampGmt": "",
+        "latestValue": 1,
+        "maxValue": 1,
+        "minValue": 1
+      },
+      "source": "",
+      "stress": {
+        "activityDurationInMillis": 1,
+        "activityProportion": 0.5,
+        "avgLevel": 1,
+        "highStressDurationInMillis": 1,
+        "highStressProportion": 0.5,
+        "lowStressDurationInMillis": 1,
+        "lowStressProportion": 0.5,
+        "maxLevel": 1,
+        "mediumStressDurationInMillis": 1,
+        "mediumStressProportion": 0.5,
+        "qualifier": "",
+        "restDurationInMillis": 1,
+        "restProportion": 0.5,
+        "totalDurationInMillis": 1,
+        "uncategorizedDurationInMillis": 1,
+        "uncategorizedProportion": 0.5
+      },
+      "userProfilePk": 1,
+      "uuid": "",
+      "wellnessChronology": {
+        "endTimestampGmt": "",
+        "endTimestampLocal": "",
+        "startTimestampGmt": "",
+        "startTimestampLocal": "",
+        "totalDurationInMillis": 1
+      }
+    }
+  ]
+}
