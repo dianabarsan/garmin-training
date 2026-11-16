@@ -270,193 +270,220 @@ func thinHeartRate(samples []garmin.HeartRateSample, bucket time.Duration) []HRS
 func (s *Server) registerHealthTools() {
 	addTool(s, "get_daily_summaries", "Daily wellness summaries",
 		"One row per day: steps, distance, calories, resting/min/max heart rate, average stress, Body Battery, intensity minutes, respiration, SpO2 and hydration.",
-		func(ctx context.Context, in rangeIn) (daysOut[DaySummaryOut], error) {
-			st, en, err := s.dateRange(in.Start, in.End)
-			if err != nil {
-				return daysOut[DaySummaryOut]{}, err
-			}
-			ds, err := s.api.DailySummaries(ctx, st, en)
-			if err != nil {
-				return daysOut[DaySummaryOut]{}, err
-			}
-			out := daysOut[DaySummaryOut]{Count: len(ds), Days: make([]DaySummaryOut, 0, len(ds))}
-			for _, d := range ds {
-				out.Days = append(out.Days, daySummaryOut(d))
-			}
-			return out, nil
-		})
+		s.getDailySummaries)
 
 	addTool(s, "get_sleep", "Sleep",
 		"Sleep per day: duration and stages, sleep score, heart rate, respiration, SpO2, Garmin's sleep-need estimate and any naps. Days with only naps have has_sleep false.",
-		func(ctx context.Context, in rangeIn) (daysOut[SleepOut], error) {
-			st, en, err := s.dateRange(in.Start, in.End)
-			if err != nil {
-				return daysOut[SleepOut]{}, err
-			}
-			sl, err := s.api.SleepRange(ctx, st, en)
-			if err != nil {
-				return daysOut[SleepOut]{}, err
-			}
-			out := daysOut[SleepOut]{Count: len(sl), Days: make([]SleepOut, 0, len(sl))}
-			for _, x := range sl {
-				out.Days = append(out.Days, sleepOut(x))
-			}
-			return out, nil
-		})
+		s.getSleep)
 
 	addTool(s, "get_heart_rate", "Heart rate for a day",
 		"Resting, minimum and maximum heart rate for one day, with the 7-day average resting rate and optionally the heart-rate curve averaged into buckets.",
-		func(ctx context.Context, in heartRateIn) (heartRateOut, error) {
-			day, err := s.oneDate(in.Date)
-			if err != nil {
-				return heartRateOut{}, err
-			}
-			bucket := in.BucketMinutes
-			switch {
-			case bucket == 0:
-				bucket = 30
-			case bucket < 1 || bucket > 240:
-				return heartRateOut{}, fmt.Errorf("bucket_minutes must be between 1 and 240")
-			}
-			h, err := s.api.HeartRate(ctx, day)
-			if err != nil {
-				return heartRateOut{}, err
-			}
-			out := heartRateOut{
-				Date: h.CalendarDate, RestingHR: h.Resting, MinHR: h.Min, MaxHR: h.Max,
-				AvgRestingHR7d: h.LastSevenDaysAvgResting, SampleCount: len(h.Samples),
-			}
-			if out.Date == "" {
-				out.Date = day.Format(time.DateOnly)
-			}
-			if in.IncludeSample {
-				out.Samples = thinHeartRate(h.Samples, time.Duration(bucket)*time.Minute)
-			}
-			return out, nil
-		})
+		s.getHeartRate)
 
 	addTool(s, "get_hrv", "Heart rate variability",
 		"Nightly HRV per day: last-night average, weekly average, 5-minute peak, status (BALANCED, UNBALANCED, ...) and the personal baseline range, all in milliseconds.",
-		func(ctx context.Context, in rangeIn) (daysOut[HRVNightOut], error) {
-			st, en, err := s.dateRange(in.Start, in.End)
-			if err != nil {
-				return daysOut[HRVNightOut]{}, err
-			}
-			ns, err := s.api.HRVRange(ctx, st, en)
-			if err != nil {
-				return daysOut[HRVNightOut]{}, err
-			}
-			out := daysOut[HRVNightOut]{Count: len(ns), Days: make([]HRVNightOut, 0, len(ns))}
-			for _, n := range ns {
-				o := HRVNightOut{Date: n.CalendarDate, LastNightAvg: n.LastNightAvg, WeeklyAvg: n.WeeklyAvg, Peak5Min: n.LastNight5MinHigh, Status: n.Status, Feedback: n.FeedbackPhrase}
-				if n.Baseline != nil {
-					o.BaselineLow, o.BaselineHigh = n.Baseline.BalancedLow, n.Baseline.BalancedUpper
-				}
-				out.Days = append(out.Days, o)
-			}
-			return out, nil
-		})
+		s.getHrv)
 
 	addTool(s, "get_body_battery", "Body Battery",
 		"Body Battery (0 to 100 energy score) per day: amount charged and drained, the day's high and low, and first and last reading.",
-		func(ctx context.Context, in rangeIn) (daysOut[BodyBatteryOut], error) {
-			st, en, err := s.dateRange(in.Start, in.End)
-			if err != nil {
-				return daysOut[BodyBatteryOut]{}, err
-			}
-			bb, err := s.api.BodyBattery(ctx, st, en)
-			if err != nil {
-				return daysOut[BodyBatteryOut]{}, err
-			}
-			out := daysOut[BodyBatteryOut]{Count: len(bb), Days: make([]BodyBatteryOut, 0, len(bb))}
-			for _, d := range bb {
-				o := BodyBatteryOut{Date: d.Date, Charged: d.Charged, Drained: d.Drained, SampleCount: len(d.Samples)}
-				if len(d.Samples) > 0 {
-					o.High, o.Low = d.Samples[0].Level, d.Samples[0].Level
-					o.First, o.Last = d.Samples[0].Level, d.Samples[len(d.Samples)-1].Level
-					for _, p := range d.Samples {
-						o.High, o.Low = max(o.High, p.Level), min(o.Low, p.Level)
-					}
-				}
-				out.Days = append(out.Days, o)
-			}
-			return out, nil
-		})
+		s.getBodyBattery)
 
 	addTool(s, "get_stress", "Stress",
 		"Daily stress: overall level (0 to 100) and seconds spent resting and in low, medium and high stress.",
-		func(ctx context.Context, in rangeIn) (daysOut[StressDayOut], error) {
-			st, en, err := s.dateRange(in.Start, in.End)
-			if err != nil {
-				return daysOut[StressDayOut]{}, err
-			}
-			ds, err := s.api.Stress(ctx, st, en)
-			if err != nil {
-				return daysOut[StressDayOut]{}, err
-			}
-			out := daysOut[StressDayOut]{Count: len(ds), Days: make([]StressDayOut, 0, len(ds))}
-			for _, d := range ds {
-				v := d.Values
-				out.Days = append(out.Days, StressDayOut{Date: d.CalendarDate, Level: v.OverallLevel, RestS: v.RestSeconds, LowS: v.LowSeconds, MediumS: v.MediumSeconds, HighS: v.HighSeconds})
-			}
-			return out, nil
-		})
+		s.getStress)
 
 	addTool(s, "get_steps", "Steps",
 		"Daily step count, step goal and distance walked.",
-		func(ctx context.Context, in rangeIn) (daysOut[StepsDayOut], error) {
-			st, en, err := s.dateRange(in.Start, in.End)
-			if err != nil {
-				return daysOut[StepsDayOut]{}, err
-			}
-			ds, err := s.api.Steps(ctx, st, en)
-			if err != nil {
-				return daysOut[StepsDayOut]{}, err
-			}
-			out := daysOut[StepsDayOut]{Count: len(ds), Days: make([]StepsDayOut, 0, len(ds))}
-			for _, d := range ds {
-				out.Days = append(out.Days, StepsDayOut{Date: d.CalendarDate, Steps: d.TotalSteps, Goal: d.StepGoal, DistanceM: r1(d.TotalDistance)})
-			}
-			return out, nil
-		})
+		s.getSteps)
 
 	addTool(s, "get_vo2max", "VO2 max",
 		"VO2 max history (ml/kg/min). Garmin records an entry when it recomputes the estimate, so days can be missing; widen the range if the result is empty.",
-		func(ctx context.Context, in vo2In) (daysOut[VO2DayOut], error) {
-			st, en, err := s.dateRange(in.Start, in.End)
-			if err != nil {
-				return daysOut[VO2DayOut]{}, err
-			}
-			var sports []string
-			if in.Sport != "" {
-				sports = []string{in.Sport}
-			}
-			vs, err := s.api.VO2Max(ctx, st, en, sports...)
-			if err != nil {
-				return daysOut[VO2DayOut]{}, err
-			}
-			out := daysOut[VO2DayOut]{Count: len(vs), Days: make([]VO2DayOut, 0, len(vs))}
-			for _, v := range vs {
-				out.Days = append(out.Days, VO2DayOut{General: vo2Out(v.Generic), Cycling: vo2Out(v.Cycling)})
-			}
-			return out, nil
-		})
+		s.getVo2max)
 
 	addTool(s, "get_heart_rate_zones", "Heart-rate zones",
 		"The user's heart-rate zones for a sport as inclusive bpm ranges, with resting, threshold and maximum heart rate.",
-		func(ctx context.Context, in zonesIn) (zonesOut, error) {
-			sport := in.Sport
-			if sport == "" {
-				sport = "running"
+		s.getHeartRateZones)
+}
+
+// getDailySummaries handles the get_daily_summaries tool.
+func (s *Server) getDailySummaries(ctx context.Context, in rangeIn) (daysOut[DaySummaryOut], error) {
+	st, en, err := s.dateRange(in.Start, in.End)
+	if err != nil {
+		return daysOut[DaySummaryOut]{}, err
+	}
+	ds, err := s.api.DailySummaries(ctx, st, en)
+	if err != nil {
+		return daysOut[DaySummaryOut]{}, err
+	}
+	out := daysOut[DaySummaryOut]{Count: len(ds), Days: make([]DaySummaryOut, 0, len(ds))}
+	for _, d := range ds {
+		out.Days = append(out.Days, daySummaryOut(d))
+	}
+	return out, nil
+}
+
+// getSleep handles the get_sleep tool.
+func (s *Server) getSleep(ctx context.Context, in rangeIn) (daysOut[SleepOut], error) {
+	st, en, err := s.dateRange(in.Start, in.End)
+	if err != nil {
+		return daysOut[SleepOut]{}, err
+	}
+	sl, err := s.api.SleepRange(ctx, st, en)
+	if err != nil {
+		return daysOut[SleepOut]{}, err
+	}
+	out := daysOut[SleepOut]{Count: len(sl), Days: make([]SleepOut, 0, len(sl))}
+	for _, x := range sl {
+		out.Days = append(out.Days, sleepOut(x))
+	}
+	return out, nil
+}
+
+// getHeartRate handles the get_heart_rate tool.
+func (s *Server) getHeartRate(ctx context.Context, in heartRateIn) (heartRateOut, error) {
+	day, err := s.oneDate(in.Date)
+	if err != nil {
+		return heartRateOut{}, err
+	}
+	bucket := in.BucketMinutes
+	switch {
+	case bucket == 0:
+		bucket = 30
+	case bucket < 1 || bucket > 240:
+		return heartRateOut{}, fmt.Errorf("bucket_minutes must be between 1 and 240")
+	}
+	h, err := s.api.HeartRate(ctx, day)
+	if err != nil {
+		return heartRateOut{}, err
+	}
+	out := heartRateOut{
+		Date: h.CalendarDate, RestingHR: h.Resting, MinHR: h.Min, MaxHR: h.Max,
+		AvgRestingHR7d: h.LastSevenDaysAvgResting, SampleCount: len(h.Samples),
+	}
+	if out.Date == "" {
+		out.Date = day.Format(time.DateOnly)
+	}
+	if in.IncludeSample {
+		out.Samples = thinHeartRate(h.Samples, time.Duration(bucket)*time.Minute)
+	}
+	return out, nil
+}
+
+// getHrv handles the get_hrv tool.
+func (s *Server) getHrv(ctx context.Context, in rangeIn) (daysOut[HRVNightOut], error) {
+	st, en, err := s.dateRange(in.Start, in.End)
+	if err != nil {
+		return daysOut[HRVNightOut]{}, err
+	}
+	ns, err := s.api.HRVRange(ctx, st, en)
+	if err != nil {
+		return daysOut[HRVNightOut]{}, err
+	}
+	out := daysOut[HRVNightOut]{Count: len(ns), Days: make([]HRVNightOut, 0, len(ns))}
+	for _, n := range ns {
+		o := HRVNightOut{Date: n.CalendarDate, LastNightAvg: n.LastNightAvg, WeeklyAvg: n.WeeklyAvg, Peak5Min: n.LastNight5MinHigh, Status: n.Status, Feedback: n.FeedbackPhrase}
+		if n.Baseline != nil {
+			o.BaselineLow, o.BaselineHigh = n.Baseline.BalancedLow, n.Baseline.BalancedUpper
+		}
+		out.Days = append(out.Days, o)
+	}
+	return out, nil
+}
+
+// getBodyBattery handles the get_body_battery tool.
+func (s *Server) getBodyBattery(ctx context.Context, in rangeIn) (daysOut[BodyBatteryOut], error) {
+	st, en, err := s.dateRange(in.Start, in.End)
+	if err != nil {
+		return daysOut[BodyBatteryOut]{}, err
+	}
+	bb, err := s.api.BodyBattery(ctx, st, en)
+	if err != nil {
+		return daysOut[BodyBatteryOut]{}, err
+	}
+	out := daysOut[BodyBatteryOut]{Count: len(bb), Days: make([]BodyBatteryOut, 0, len(bb))}
+	for _, d := range bb {
+		o := BodyBatteryOut{Date: d.Date, Charged: d.Charged, Drained: d.Drained, SampleCount: len(d.Samples)}
+		if len(d.Samples) > 0 {
+			o.High, o.Low = d.Samples[0].Level, d.Samples[0].Level
+			o.First, o.Last = d.Samples[0].Level, d.Samples[len(d.Samples)-1].Level
+			for _, p := range d.Samples {
+				o.High, o.Low = max(o.High, p.Level), min(o.Low, p.Level)
 			}
-			z, err := s.api.HeartRateZonesFor(ctx, sport)
-			if err != nil {
-				return zonesOut{}, err
-			}
-			out := zonesOut{Sport: z.Sport, TrainingMethod: z.TrainingMethod, Configured: z.Configured(), RestingHR: z.RestingHR, ThresholdHR: z.LactateThresholdHR, MaxHR: z.MaxHR, Zones: make([]ZoneOut, 0, len(z.Zones))}
-			for _, hz := range z.Zones {
-				out.Zones = append(out.Zones, ZoneOut{Zone: hz.Number, MinBPM: hz.MinBPM, MaxBPM: hz.MaxBPM})
-			}
-			return out, nil
-		})
+		}
+		out.Days = append(out.Days, o)
+	}
+	return out, nil
+}
+
+// getStress handles the get_stress tool.
+func (s *Server) getStress(ctx context.Context, in rangeIn) (daysOut[StressDayOut], error) {
+	st, en, err := s.dateRange(in.Start, in.End)
+	if err != nil {
+		return daysOut[StressDayOut]{}, err
+	}
+	ds, err := s.api.Stress(ctx, st, en)
+	if err != nil {
+		return daysOut[StressDayOut]{}, err
+	}
+	out := daysOut[StressDayOut]{Count: len(ds), Days: make([]StressDayOut, 0, len(ds))}
+	for _, d := range ds {
+		v := d.Values
+		out.Days = append(out.Days, StressDayOut{Date: d.CalendarDate, Level: v.OverallLevel, RestS: v.RestSeconds, LowS: v.LowSeconds, MediumS: v.MediumSeconds, HighS: v.HighSeconds})
+	}
+	return out, nil
+}
+
+// getSteps handles the get_steps tool.
+func (s *Server) getSteps(ctx context.Context, in rangeIn) (daysOut[StepsDayOut], error) {
+	st, en, err := s.dateRange(in.Start, in.End)
+	if err != nil {
+		return daysOut[StepsDayOut]{}, err
+	}
+	ds, err := s.api.Steps(ctx, st, en)
+	if err != nil {
+		return daysOut[StepsDayOut]{}, err
+	}
+	out := daysOut[StepsDayOut]{Count: len(ds), Days: make([]StepsDayOut, 0, len(ds))}
+	for _, d := range ds {
+		out.Days = append(out.Days, StepsDayOut{Date: d.CalendarDate, Steps: d.TotalSteps, Goal: d.StepGoal, DistanceM: r1(d.TotalDistance)})
+	}
+	return out, nil
+}
+
+// getVo2max handles the get_vo2max tool.
+func (s *Server) getVo2max(ctx context.Context, in vo2In) (daysOut[VO2DayOut], error) {
+	st, en, err := s.dateRange(in.Start, in.End)
+	if err != nil {
+		return daysOut[VO2DayOut]{}, err
+	}
+	var sports []string
+	if in.Sport != "" {
+		sports = []string{in.Sport}
+	}
+	vs, err := s.api.VO2Max(ctx, st, en, sports...)
+	if err != nil {
+		return daysOut[VO2DayOut]{}, err
+	}
+	out := daysOut[VO2DayOut]{Count: len(vs), Days: make([]VO2DayOut, 0, len(vs))}
+	for _, v := range vs {
+		out.Days = append(out.Days, VO2DayOut{General: vo2Out(v.Generic), Cycling: vo2Out(v.Cycling)})
+	}
+	return out, nil
+}
+
+// getHeartRateZones handles the get_heart_rate_zones tool.
+func (s *Server) getHeartRateZones(ctx context.Context, in zonesIn) (zonesOut, error) {
+	sport := in.Sport
+	if sport == "" {
+		sport = "running"
+	}
+	z, err := s.api.HeartRateZonesFor(ctx, sport)
+	if err != nil {
+		return zonesOut{}, err
+	}
+	out := zonesOut{Sport: z.Sport, TrainingMethod: z.TrainingMethod, Configured: z.Configured(), RestingHR: z.RestingHR, ThresholdHR: z.LactateThresholdHR, MaxHR: z.MaxHR, Zones: make([]ZoneOut, 0, len(z.Zones))}
+	for _, hz := range z.Zones {
+		out.Zones = append(out.Zones, ZoneOut{Zone: hz.Number, MinBPM: hz.MinBPM, MaxBPM: hz.MaxBPM})
+	}
+	return out, nil
 }

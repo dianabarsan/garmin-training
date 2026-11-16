@@ -265,130 +265,145 @@ func opt(p *float64) *float64 {
 func (s *Server) registerActivityTools() {
 	addTool(s, "list_activities", "List activities",
 		"Find the user's activities (runs, rides, strength sessions, ...), newest first, with distance, duration, heart rate, training effect, elevation and, for strength sessions, the per-exercise breakdown. Filter by date, type, text and size.",
-		func(ctx context.Context, in listActivitiesIn) (listActivitiesOut, error) {
-			limit := in.Limit
-			switch {
-			case limit == 0:
-				limit = defaultActivityPage
-			case limit < 0 || limit > maxActivityPage:
-				return listActivitiesOut{}, fmt.Errorf("limit must be between 1 and %d", maxActivityPage)
-			}
-			opts := garmin.ActivitiesOptions{
-				Start: in.Offset, Limit: limit, TypeKey: in.Type, SubTypeKey: in.SubType, Search: in.Search,
-				MinDistance: in.MinDistanceM, MaxDistance: in.MaxDistanceM, MinDuration: in.MinDurationS, MaxDuration: in.MaxDurationS,
-				SortBy: in.SortBy, Ascending: in.Ascending,
-			}
-			var err error
-			if in.StartDate != "" {
-				if opts.StartDate, err = parseDay("start_date", in.StartDate); err != nil {
-					return listActivitiesOut{}, err
-				}
-			}
-			if in.EndDate != "" {
-				if opts.EndDate, err = parseDay("end_date", in.EndDate); err != nil {
-					return listActivitiesOut{}, err
-				}
-			}
-			acts, err := s.api.Activities(ctx, opts)
-			if err != nil {
-				return listActivitiesOut{}, err
-			}
-			out := listActivitiesOut{Count: len(acts), Activities: make([]ActivityOut, 0, len(acts))}
-			for _, a := range acts {
-				out.Activities = append(out.Activities, activityOut(a))
-			}
-			if len(acts) == limit {
-				out.NextOffset = ptr(in.Offset + len(acts))
-			}
-			return out, nil
-		})
+		s.listActivities)
 
 	addTool(s, "get_activity", "Get one activity",
 		"Summary of a single activity by id: type, time zone, distance, duration, heart rate, elevation, training effect.",
-		func(ctx context.Context, in activityIDIn) (ActivityOut, error) {
-			d, err := s.api.ActivityDetail(ctx, in.ActivityID)
-			if err != nil {
-				return ActivityOut{}, err
-			}
-			o := ActivityOut{ID: d.ID, Name: d.Name, Type: d.Type.Key, TimeZone: d.TimeZone}
-			metricsOut(&o, d.Summary)
-			return o, nil
-		})
+		s.getActivity)
 
 	addTool(s, "get_activity_splits", "Get activity splits",
 		"Per-kilometre (or per-mile) splits of a run or ride, computed from the per-second data: time, pace, heart rate, cadence and elevation for each segment. Not available for activities without distance, such as strength training.",
-		func(ctx context.Context, in splitsIn) (splitsOut, error) {
-			size := in.SplitM
-			if size == 0 {
-				size = 1000
-			}
-			if size < 10 {
-				return splitsOut{}, fmt.Errorf("split_distance_m must be at least 10")
-			}
-			series, err := s.api.ActivitySeries(ctx, in.ActivityID)
-			if err != nil {
-				return splitsOut{}, err
-			}
-			splits, err := series.Splits(size)
-			if err != nil {
-				return splitsOut{}, err
-			}
-			out := splitsOut{ActivityID: in.ActivityID, SplitM: size, Splits: make([]SplitOut, 0, len(splits))}
-			for _, sp := range splits {
-				out.Splits = append(out.Splits, SplitOut{
-					Index: sp.Index, DistanceM: r1(sp.Distance), DurationS: r1(sp.Duration), PaceSPerKm: r1(sp.PaceSecondsPerKm()),
-					AvgSpeedMPS: r2(sp.AvgSpeed), AvgHR: r1(sp.AvgHeartRate), MaxHR: r1(sp.MaxHeartRate), AvgCadenceSPM: r1(sp.AvgCadence),
-					ElevationGainM: r1(sp.ElevationGain), ElevationLossM: r1(sp.ElevationLoss), Partial: sp.Partial,
-				})
-			}
-			return out, nil
-		})
+		s.getActivitySplits)
 
 	addTool(s, "get_activity_series", "Get activity time series",
 		"Heart rate, speed, elevation, cadence and power over time for one activity (GPS coordinates are never included). Samples are thinned to max_points evenly spaced points.",
-		func(ctx context.Context, in seriesIn) (seriesOut, error) {
-			maxPts := in.MaxPoints
-			switch {
-			case maxPts == 0:
-				maxPts = 200
-			case maxPts < 10 || maxPts > 1000:
-				return seriesOut{}, fmt.Errorf("max_points must be between 10 and 1000")
-			}
-			series, err := s.api.ActivitySeries(ctx, in.ActivityID)
-			if err != nil {
-				return seriesOut{}, err
-			}
-			out := seriesOut{ActivityID: in.ActivityID, TotalPoints: len(series.Points)}
-			n := len(series.Points)
-			for i := 0; i < maxPts && i < n; i++ {
-				idx := i
-				if n > maxPts { // evenly spaced, always including the first and last sample
-					idx = int(math.Round(float64(i) * float64(n-1) / float64(maxPts-1)))
-				}
-				p := series.Points[idx]
-				out.Points = append(out.Points, SeriesPointOut{
-					TimeS: r1(p.Duration), DistanceM: r1(p.Distance),
-					HR: opt(p.HeartRate), SpeedMPS: opt(p.Speed), ElevationM: opt(p.Elevation), CadenceSPM: opt(p.Cadence), PowerW: opt(p.Power),
-				})
-			}
-			return out, nil
+		s.getActivitySeries)
+}
+
+// listActivities handles the list_activities tool.
+func (s *Server) listActivities(ctx context.Context, in listActivitiesIn) (listActivitiesOut, error) {
+	limit := in.Limit
+	switch {
+	case limit == 0:
+		limit = defaultActivityPage
+	case limit < 0 || limit > maxActivityPage:
+		return listActivitiesOut{}, fmt.Errorf("limit must be between 1 and %d", maxActivityPage)
+	}
+	opts := garmin.ActivitiesOptions{
+		Start: in.Offset, Limit: limit, TypeKey: in.Type, SubTypeKey: in.SubType, Search: in.Search,
+		MinDistance: in.MinDistanceM, MaxDistance: in.MaxDistanceM, MinDuration: in.MinDurationS, MaxDuration: in.MaxDurationS,
+		SortBy: in.SortBy, Ascending: in.Ascending,
+	}
+	var err error
+	if in.StartDate != "" {
+		if opts.StartDate, err = parseDay("start_date", in.StartDate); err != nil {
+			return listActivitiesOut{}, err
+		}
+	}
+	if in.EndDate != "" {
+		if opts.EndDate, err = parseDay("end_date", in.EndDate); err != nil {
+			return listActivitiesOut{}, err
+		}
+	}
+	acts, err := s.api.Activities(ctx, opts)
+	if err != nil {
+		return listActivitiesOut{}, err
+	}
+	out := listActivitiesOut{Count: len(acts), Activities: make([]ActivityOut, 0, len(acts))}
+	for _, a := range acts {
+		out.Activities = append(out.Activities, activityOut(a))
+	}
+	if len(acts) == limit {
+		out.NextOffset = ptr(in.Offset + len(acts))
+	}
+	return out, nil
+}
+
+// getActivity handles the get_activity tool.
+func (s *Server) getActivity(ctx context.Context, in activityIDIn) (ActivityOut, error) {
+	d, err := s.api.ActivityDetail(ctx, in.ActivityID)
+	if err != nil {
+		return ActivityOut{}, err
+	}
+	o := ActivityOut{ID: d.ID, Name: d.Name, Type: d.Type.Key, TimeZone: d.TimeZone}
+	metricsOut(&o, d.Summary)
+	return o, nil
+}
+
+// getActivitySplits handles the get_activity_splits tool.
+func (s *Server) getActivitySplits(ctx context.Context, in splitsIn) (splitsOut, error) {
+	size := in.SplitM
+	if size == 0 {
+		size = 1000
+	}
+	if size < 10 {
+		return splitsOut{}, fmt.Errorf("split_distance_m must be at least 10")
+	}
+	series, err := s.api.ActivitySeries(ctx, in.ActivityID)
+	if err != nil {
+		return splitsOut{}, err
+	}
+	splits, err := series.Splits(size)
+	if err != nil {
+		return splitsOut{}, err
+	}
+	out := splitsOut{ActivityID: in.ActivityID, SplitM: size, Splits: make([]SplitOut, 0, len(splits))}
+	for _, sp := range splits {
+		out.Splits = append(out.Splits, SplitOut{
+			Index: sp.Index, DistanceM: r1(sp.Distance), DurationS: r1(sp.Duration), PaceSPerKm: r1(sp.PaceSecondsPerKm()),
+			AvgSpeedMPS: r2(sp.AvgSpeed), AvgHR: r1(sp.AvgHeartRate), MaxHR: r1(sp.MaxHeartRate), AvgCadenceSPM: r1(sp.AvgCadence),
+			ElevationGainM: r1(sp.ElevationGain), ElevationLossM: r1(sp.ElevationLoss), Partial: sp.Partial,
 		})
+	}
+	return out, nil
+}
+
+// getActivitySeries handles the get_activity_series tool.
+func (s *Server) getActivitySeries(ctx context.Context, in seriesIn) (seriesOut, error) {
+	maxPts := in.MaxPoints
+	switch {
+	case maxPts == 0:
+		maxPts = 200
+	case maxPts < 10 || maxPts > 1000:
+		return seriesOut{}, fmt.Errorf("max_points must be between 10 and 1000")
+	}
+	series, err := s.api.ActivitySeries(ctx, in.ActivityID)
+	if err != nil {
+		return seriesOut{}, err
+	}
+	out := seriesOut{ActivityID: in.ActivityID, TotalPoints: len(series.Points)}
+	n := len(series.Points)
+	for i := 0; i < maxPts && i < n; i++ {
+		idx := i
+		if n > maxPts { // evenly spaced, always including the first and last sample
+			idx = int(math.Round(float64(i) * float64(n-1) / float64(maxPts-1)))
+		}
+		p := series.Points[idx]
+		out.Points = append(out.Points, SeriesPointOut{
+			TimeS: r1(p.Duration), DistanceM: r1(p.Distance),
+			HR: opt(p.HeartRate), SpeedMPS: opt(p.Speed), ElevationM: opt(p.Elevation), CadenceSPM: opt(p.Cadence), PowerW: opt(p.Power),
+		})
+	}
+	return out, nil
 }
 
 // registerTools adds every tool to the MCP server.
 func (s *Server) registerTools() {
 	addTool(s, "auth_status", "Check Garmin authentication",
 		"Reports whether a Garmin Personal API key has been provided. Use it when another tool fails with an authentication error.",
-		func(context.Context, struct{}) (statusOut, error) {
-			st := s.creds.Status()
-			out := statusOut{Authenticated: st.Authenticated}
-			if !st.Authenticated {
-				out.Help = "Ask the user to open this server's address in a browser and paste their Garmin Personal API key (created at connect.garmin.com/app/settings/personalApiToken), or POST {\"api_key\": \"...\"} to /auth."
-			}
-			return out, nil
-		})
+		s.authStatus)
 	s.registerActivityTools()
 	s.registerHealthTools()
+}
+
+// authStatus handles the auth_status tool.
+func (s *Server) authStatus(_ context.Context, _ struct{}) (statusOut, error) {
+	st := s.creds.Status()
+	out := statusOut{Authenticated: st.Authenticated}
+	if !st.Authenticated {
+		out.Help = "Ask the user to open this server's address in a browser and paste their Garmin Personal API key (created at connect.garmin.com/app/settings/personalApiToken), or POST {\"api_key\": \"...\"} to /auth."
+	}
+	return out, nil
 }
 
 type statusOut struct {

@@ -41,129 +41,174 @@ func main() {
 	}
 }
 
+// config is everything run needs, gathered from flags and the environment.
+type config struct {
+	addr         string
+	token        string
+	allowedHosts []string
+	keyStore     string
+	garminURL    string
+	logLevel     string
+	envKey       string // initial API key from GARMIN_PERSONAL_API_KEY[_FILE]
+	healthcheck  bool
+	showVersion  bool
+}
+
 // run starts the server and blocks until ctx is cancelled or serving fails.
 // ready, when non-nil, is called with the bound address once it is listening.
 func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer, ready func(addr string)) error {
-	// Secrets may come from the environment or, safer in containers, from a file
-	// named by NAME_FILE (the Docker secrets convention).
-	tokenDefault, err := secret(getenv, "GARMIN_MCP_TOKEN")
-	if err != nil {
+	cfg, err := parseConfig(args, getenv, stderr)
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		return nil
+	case err != nil:
 		return err
-	}
-	envKey, err := secret(getenv, "GARMIN_PERSONAL_API_KEY")
-	if err != nil {
-		return err
-	}
-
-	fs := flag.NewFlagSet("garmin-mcp", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	addr := fs.String("addr", "127.0.0.1:8808", "address to listen on; a non-loopback address requires -token")
-	token := fs.String("token", tokenDefault, "require this bearer token on /mcp and /auth (env GARMIN_MCP_TOKEN or GARMIN_MCP_TOKEN_FILE)")
-	allowedHosts := fs.String("allowed-host", getenv("GARMIN_MCP_ALLOWED_HOSTS"), "comma-separated public hostnames this server may be reached as, e.g. garmin.example.com; set it behind a reverse proxy (env GARMIN_MCP_ALLOWED_HOSTS)")
-	healthcheck := fs.Bool("healthcheck", false, "probe a running server at -addr and exit 0 if it is healthy (for container health checks)")
-	keyStore := fs.String("key-store", getenv("GARMIN_MCP_KEY_STORE"), "file in which to keep the API key between restarts, mode 0600 (env GARMIN_MCP_KEY_STORE); the key stays in memory only when unset")
-	baseURL := fs.String("garmin-url", getenv("GARMIN_PERSONAL_API_BASE_URL"), "Garmin API base URL; for testing")
-	level := fs.String("log-level", "info", "debug, info, warn or error")
-	showVersion := fs.Bool("version", false, "print the version and exit")
-	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth.\n\nFlags:\n")
-		fs.PrintDefaults()
-	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
-	if *showVersion {
+	case cfg.showVersion:
 		fmt.Fprintln(stderr, "garmin-mcp", version)
 		return nil
-	}
-	if *healthcheck {
-		return probeHealth(ctx, *addr)
+	case cfg.healthcheck:
+		return probeHealth(ctx, cfg.addr)
 	}
 
-	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(*level)); err != nil {
-		return fmt.Errorf("invalid -log-level %q", *level)
-	}
-	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: lvl}))
-
-	credOpts := []mcpserver.CredentialsOption{}
-	if *baseURL != "" {
-		credOpts = append(credOpts, mcpserver.WithAuthBaseURL(*baseURL))
-	}
-	if *keyStore != "" {
-		path, err := filepath.Abs(*keyStore)
-		if err != nil {
-			return fmt.Errorf("-key-store: %w", err)
-		}
-		credOpts = append(credOpts, mcpserver.WithKeyStore(mcpserver.NewFileKeyStore(path)))
-	}
-	creds := mcpserver.NewCredentials(credOpts...)
-
-	clientOpts := []garmin.Option{garmin.WithTokenSource(creds), garmin.WithUserAgent("garmin-mcp/" + version)}
-	if *baseURL != "" {
-		clientOpts = append(clientOpts, garmin.WithBaseURL(*baseURL))
-	}
-	srv, err := mcpserver.New(mcpserver.Config{
-		API:          garmin.New(clientOpts...),
-		Credentials:  creds,
-		Token:        *token,
-		Addr:         *addr,
-		AllowedHosts: splitList(*allowedHosts),
-		Logger:       log,
-		Version:      version,
-	})
+	log, err := newLogger(cfg.logLevel, stderr)
 	if err != nil {
 		return err
 	}
-
-	// Initial key: an explicit environment variable wins, otherwise the store.
-	switch {
-	case envKey != "":
-		vctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		err := creds.Set(vctx, envKey)
-		cancel()
-		if err != nil {
-			// Not fatal: the key can still be provided at /auth.
-			log.Warn("the API key from GARMIN_PERSONAL_API_KEY was not accepted; provide a key at /auth", "reason", reasonOf(err))
-		} else {
-			log.Info("API key from the environment accepted")
-		}
-	default:
-		if ok, err := creds.LoadStored(); err != nil {
-			log.Warn("could not read the stored key", "err", err)
-		} else if ok {
-			log.Info("API key loaded from the key store")
-		}
-	}
-
-	ln, err := net.Listen("tcp", *addr)
+	creds, srv, err := newServer(cfg, log)
 	if err != nil {
 		return err
 	}
-	// Every request context derives from connCtx, so cancelling it ends open
-	// event streams, which would otherwise hold a graceful shutdown for its
-	// full timeout.
-	connCtx, cancelConns := context.WithCancel(context.Background())
-	defer cancelConns()
-	httpSrv := &http.Server{
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		BaseContext:       func(net.Listener) context.Context { return connCtx },
-		// No WriteTimeout: MCP responses can be long-lived event streams.
+	loadInitialKey(ctx, creds, cfg.envKey, log)
+
+	ln, err := net.Listen("tcp", cfg.addr)
+	if err != nil {
+		return err
 	}
 	bound := ln.Addr().String()
-	log.Info("listening", "addr", bound, "mcp", "/mcp", "auth", "/auth", "token_required", *token != "", "key_loaded", creds.Status().Authenticated)
+	log.Info("listening", "addr", bound, "mcp", "/mcp", "auth", "/auth", "token_required", cfg.token != "", "key_loaded", creds.Status().Authenticated)
 	if !creds.Status().Authenticated {
 		log.Info("no API key yet: open the address in a browser, or POST {\"api_key\": \"...\"} to /auth")
 	}
 	if ready != nil {
 		ready(bound)
 	}
+	return serve(ctx, ln, srv.Handler())
+}
 
+// parseConfig reads flags and the environment. It returns flag.ErrHelp when
+// help was requested. Secrets may come from the environment or, safer in
+// containers, from a file named by NAME_FILE (the Docker secrets convention).
+func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (config, error) {
+	tokenDefault, err := secret(getenv, "GARMIN_MCP_TOKEN")
+	if err != nil {
+		return config{}, err
+	}
+	envKey, err := secret(getenv, "GARMIN_PERSONAL_API_KEY")
+	if err != nil {
+		return config{}, err
+	}
+
+	fs := flag.NewFlagSet("garmin-mcp", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfg := config{envKey: envKey}
+	var allowedHosts string
+	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8808", "address to listen on; a non-loopback address requires -token")
+	fs.StringVar(&cfg.token, "token", tokenDefault, "require this bearer token on /mcp and /auth (env GARMIN_MCP_TOKEN or GARMIN_MCP_TOKEN_FILE)")
+	fs.StringVar(&allowedHosts, "allowed-host", getenv("GARMIN_MCP_ALLOWED_HOSTS"), "comma-separated public hostnames this server may be reached as, e.g. garmin.example.com; set it behind a reverse proxy (env GARMIN_MCP_ALLOWED_HOSTS)")
+	fs.BoolVar(&cfg.healthcheck, "healthcheck", false, "probe a running server at -addr and exit 0 if it is healthy (for container health checks)")
+	fs.StringVar(&cfg.keyStore, "key-store", getenv("GARMIN_MCP_KEY_STORE"), "file in which to keep the API key between restarts, mode 0600 (env GARMIN_MCP_KEY_STORE); the key stays in memory only when unset")
+	fs.StringVar(&cfg.garminURL, "garmin-url", getenv("GARMIN_PERSONAL_API_BASE_URL"), "Garmin API base URL; for testing")
+	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
+	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth.\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+	cfg.allowedHosts = splitList(allowedHosts)
+	return cfg, nil
+}
+
+// newLogger builds the text logger for the given level name.
+func newLogger(level string, w io.Writer) (*slog.Logger, error) {
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+		return nil, fmt.Errorf("invalid -log-level %q", level)
+	}
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl})), nil
+}
+
+// newServer wires the credentials, the Garmin client and the MCP server.
+func newServer(cfg config, log *slog.Logger) (*mcpserver.Credentials, *mcpserver.Server, error) {
+	credOpts := []mcpserver.CredentialsOption{}
+	if cfg.garminURL != "" {
+		credOpts = append(credOpts, mcpserver.WithAuthBaseURL(cfg.garminURL))
+	}
+	if cfg.keyStore != "" {
+		path, err := filepath.Abs(cfg.keyStore)
+		if err != nil {
+			return nil, nil, fmt.Errorf("-key-store: %w", err)
+		}
+		credOpts = append(credOpts, mcpserver.WithKeyStore(mcpserver.NewFileKeyStore(path)))
+	}
+	creds := mcpserver.NewCredentials(credOpts...)
+
+	clientOpts := []garmin.Option{garmin.WithTokenSource(creds), garmin.WithUserAgent("garmin-mcp/" + version)}
+	if cfg.garminURL != "" {
+		clientOpts = append(clientOpts, garmin.WithBaseURL(cfg.garminURL))
+	}
+	srv, err := mcpserver.New(mcpserver.Config{
+		API:          garmin.New(clientOpts...),
+		Credentials:  creds,
+		Token:        cfg.token,
+		Addr:         cfg.addr,
+		AllowedHosts: cfg.allowedHosts,
+		Logger:       log,
+		Version:      version,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return creds, srv, nil
+}
+
+// loadInitialKey activates the starting API key: one given explicitly (the
+// environment or a secret file) wins, otherwise the key store's. A key Garmin
+// rejects is reported but not fatal, because it can still be provided at /auth.
+func loadInitialKey(ctx context.Context, creds *mcpserver.Credentials, envKey string, log *slog.Logger) {
+	if envKey != "" {
+		vctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		if err := creds.Set(vctx, envKey); err != nil {
+			log.Warn("the API key from GARMIN_PERSONAL_API_KEY was not accepted; provide a key at /auth", "reason", reasonOf(err))
+			return
+		}
+		log.Info("API key from the environment accepted")
+		return
+	}
+	if ok, err := creds.LoadStored(); err != nil {
+		log.Warn("could not read the stored key", "err", err)
+	} else if ok {
+		log.Info("API key loaded from the key store")
+	}
+}
+
+// serve runs the HTTP server on ln until ctx is cancelled, then shuts it down.
+func serve(ctx context.Context, ln net.Listener, handler http.Handler) error {
+	// Every request context derives from connCtx, so cancelling it ends open
+	// event streams, which would otherwise hold a graceful shutdown for its
+	// full timeout.
+	connCtx, cancelConns := context.WithCancel(context.Background())
+	defer cancelConns()
+	httpSrv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		BaseContext:       func(net.Listener) context.Context { return connCtx },
+		// No WriteTimeout: MCP responses can be long-lived event streams.
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.Serve(ln) }()
 	select {

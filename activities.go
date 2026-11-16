@@ -265,7 +265,18 @@ func (o ActivitiesOptions) query() (url.Values, error) {
 		"start": {strconv.Itoa(o.Start)},
 		"limit": {strconv.Itoa(limit)},
 	}
+	if err := o.addDates(q); err != nil {
+		return nil, err
+	}
+	o.addFilters(q)
+	if err := o.addRanges(q); err != nil {
+		return nil, err
+	}
+	return q, nil
+}
 
+// addDates sets the date bounds, checking they are in order.
+func (o ActivitiesOptions) addDates(q url.Values) error {
 	if !o.StartDate.IsZero() {
 		q.Set("startDate", dateParam(o.StartDate))
 	}
@@ -273,21 +284,25 @@ func (o ActivitiesOptions) query() (url.Values, error) {
 		q.Set("endDate", dateParam(o.EndDate))
 	}
 	if !o.StartDate.IsZero() && !o.EndDate.IsZero() {
-		if err := checkRange(o.StartDate, o.EndDate); err != nil {
-			return nil, err
-		}
+		return checkRange(o.StartDate, o.EndDate)
 	}
+	return nil
+}
 
-	setStr := func(key, v string) {
+// addFilters sets the type, text, sorting and flag filters; zero values are
+// left out so Garmin's defaults apply.
+func (o ActivitiesOptions) addFilters(q url.Values) {
+	for key, v := range map[string]string{
+		"activityType":    o.TypeKey,
+		"activitySubType": o.SubTypeKey,
+		"eventType":       o.EventType,
+		"search":          o.Search,
+		"sortBy":          o.SortBy,
+	} {
 		if v != "" {
 			q.Set(key, v)
 		}
 	}
-	setStr("activityType", o.TypeKey)
-	setStr("activitySubType", o.SubTypeKey)
-	setStr("eventType", o.EventType)
-	setStr("search", o.Search)
-	setStr("sortBy", o.SortBy)
 	for _, k := range o.ExcludedSubTypes {
 		q.Add("excludedActivitySubType", k)
 	}
@@ -307,7 +322,11 @@ func (o ActivitiesOptions) query() (url.Values, error) {
 			q.Set("favorite", "0")
 		}
 	}
+}
 
+// addRanges sets the distance, duration, elevation and power bounds. Negative
+// values and a minimum above its maximum are errors.
+func (o ActivitiesOptions) addRanges(q url.Values) error {
 	ranges := []struct {
 		minKey, maxKey string
 		lo, hi         int64
@@ -319,10 +338,10 @@ func (o ActivitiesOptions) query() (url.Values, error) {
 	}
 	for _, r := range ranges {
 		if r.lo < 0 || r.hi < 0 {
-			return nil, fmt.Errorf("garmin: negative %s/%s", r.minKey, r.maxKey)
+			return fmt.Errorf("garmin: negative %s/%s", r.minKey, r.maxKey)
 		}
 		if r.lo > 0 && r.hi > 0 && r.lo > r.hi {
-			return nil, fmt.Errorf("garmin: %s (%d) exceeds %s (%d)", r.minKey, r.lo, r.maxKey, r.hi)
+			return fmt.Errorf("garmin: %s (%d) exceeds %s (%d)", r.minKey, r.lo, r.maxKey, r.hi)
 		}
 		if r.lo > 0 {
 			q.Set(r.minKey, strconv.FormatInt(r.lo, 10))
@@ -332,12 +351,12 @@ func (o ActivitiesOptions) query() (url.Values, error) {
 		}
 	}
 	if o.MinAvgPower < 0 {
-		return nil, fmt.Errorf("garmin: negative minAvgPower")
+		return fmt.Errorf("garmin: negative minAvgPower")
 	}
 	if o.MinAvgPower > 0 {
 		q.Set("minAvgPower", strconv.FormatInt(o.MinAvgPower, 10))
 	}
-	return q, nil
+	return nil
 }
 
 // Activities returns one page of activities, newest first unless opts sorts otherwise.

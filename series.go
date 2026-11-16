@@ -181,20 +181,49 @@ func (s ActivitySeries) Splits(splitMeters float64) ([]Split, error) {
 	if !(splitMeters > 0) || math.IsInf(splitMeters, 0) {
 		return nil, ErrInvalidSplitSize
 	}
+	pts := monotonicPoints(s.Points)
+	if len(pts) < 2 || pts[len(pts)-1].Distance <= 0 {
+		return nil, ErrNoDistance
+	}
 
-	// Keep samples with non-decreasing distance; a backwards step is a glitch.
-	pts := make([]SeriesPoint, 0, len(s.Points))
-	for _, p := range s.Points {
+	bounds := splitBoundaries(pts, splitMeters)
+	last := pts[len(pts)-1]
+	full := len(bounds) - 1 // splits that reach the full distance
+	remainder := last.Distance - float64(full)*splitMeters
+	count := full
+	if remainder > partialEpsilon {
+		count++ // a final, shorter split
+	}
+	if count == 0 {
+		return nil, ErrNoDistance
+	}
+
+	aggs := aggregateSplits(pts, splitMeters, count)
+	return buildSplits(aggs, bounds, last.Duration, splitMeters, full, remainder), nil
+}
+
+// partialEpsilon is the smallest leftover distance, in metres, that counts as
+// a final partial split rather than rounding noise.
+const partialEpsilon = 1e-6
+
+// monotonicPoints keeps the samples whose distance never decreases; a step
+// backwards is a GPS glitch.
+func monotonicPoints(in []SeriesPoint) []SeriesPoint {
+	pts := make([]SeriesPoint, 0, len(in))
+	for _, p := range in {
 		if len(pts) > 0 && p.Distance < pts[len(pts)-1].Distance {
 			continue
 		}
 		pts = append(pts, p)
 	}
-	if len(pts) < 2 || pts[len(pts)-1].Distance <= 0 {
-		return nil, ErrNoDistance
-	}
+	return pts
+}
 
-	// Boundary clock times: bounds[k] is the timer at distance k*splitMeters.
+// splitBoundaries returns the timer reading at each whole multiple of
+// splitMeters, found by linear interpolation between the samples either side:
+// bounds[k] is the timer at distance k*splitMeters, and bounds[0] is the first
+// sample's timer.
+func splitBoundaries(pts []SeriesPoint, splitMeters float64) []float64 {
 	bounds := []float64{pts[0].Duration}
 	next := splitMeters
 	for i := 1; i < len(pts); i++ {
@@ -208,88 +237,112 @@ func (s ActivitySeries) Splits(splitMeters float64) ([]Split, error) {
 			next = float64(len(bounds)) * splitMeters
 		}
 	}
+	return bounds
+}
 
-	last := pts[len(pts)-1]
-	full := len(bounds) - 1
-	remainder := last.Distance - float64(full)*splitMeters
-	count := full
-	if remainder > 1e-6 {
-		count++
-	}
-	if count == 0 {
-		return nil, ErrNoDistance
-	}
+// splitAgg accumulates one split's sensor readings.
+type splitAgg struct {
+	hrSum, hrMax, cadSum float64
+	hrN, cadN            int
+	gain, loss           float64
+}
 
-	type agg struct {
-		hrSum, hrMax, cadSum float64
-		hrN, cadN            int
-		gain, loss           float64
+// addSensors folds a sample's heart rate and cadence into the totals.
+func (a *splitAgg) addSensors(p SeriesPoint) {
+	if p.HeartRate != nil {
+		a.hrSum += *p.HeartRate
+		a.hrMax = max(a.hrMax, *p.HeartRate)
+		a.hrN++
 	}
-	aggs := make([]agg, count)
-	// ref is the last altitude that counted; a change is only recorded once it
-	// moves at least elevationDeadband away from it.
-	var ref *float64
+	if p.Cadence != nil {
+		a.cadSum += *p.Cadence
+		a.cadN++
+	}
+}
+
+// elevationTracker turns noisy altitude samples into gain and loss. It
+// remembers the last altitude that counted, and records a change only once the
+// altitude has moved at least elevationDeadband away from it.
+type elevationTracker struct{ ref *float64 }
+
+// seed sets the starting altitude if there is none yet.
+func (t *elevationTracker) seed(e *float64) {
+	if e != nil && t.ref == nil {
+		t.ref = e
+	}
+}
+
+// step feeds one altitude and returns the gain or loss it completes, if any.
+func (t *elevationTracker) step(e *float64) (gain, loss float64) {
+	switch {
+	case t.ref == nil:
+		t.ref = e
+	case *e-*t.ref >= elevationDeadband:
+		gain = *e - *t.ref
+		t.ref = e
+	case *t.ref-*e >= elevationDeadband:
+		loss = *t.ref - *e
+		t.ref = e
+	}
+	return gain, loss
+}
+
+// splitIndex is the zero-based split a distance falls in. A distance exactly
+// on a boundary belongs to the split that ends there.
+func splitIndex(distance, splitMeters float64, count int) int {
+	k := int(math.Ceil(distance/splitMeters)) - 1
+	return min(max(k, 0), count-1)
+}
+
+// aggregateSplits assigns every sample to its split and totals heart rate,
+// cadence and elevation change per split.
+func aggregateSplits(pts []SeriesPoint, splitMeters float64, count int) []splitAgg {
+	aggs := make([]splitAgg, count)
+	var track elevationTracker
 	for _, p := range pts {
 		if p.Distance <= 0 {
-			if p.Elevation != nil && ref == nil {
-				ref = p.Elevation
-			}
+			track.seed(p.Elevation)
 			continue
 		}
-		k := int(math.Ceil(p.Distance/splitMeters)) - 1
-		k = min(max(k, 0), count-1)
-		a := &aggs[k]
-		if p.HeartRate != nil {
-			a.hrSum += *p.HeartRate
-			a.hrMax = max(a.hrMax, *p.HeartRate)
-			a.hrN++
-		}
-		if p.Cadence != nil {
-			a.cadSum += *p.Cadence
-			a.cadN++
-		}
+		a := &aggs[splitIndex(p.Distance, splitMeters, count)]
+		a.addSensors(p)
 		if p.Elevation != nil {
-			switch {
-			case ref == nil:
-				ref = p.Elevation
-			case *p.Elevation-*ref >= elevationDeadband:
-				a.gain += *p.Elevation - *ref
-				ref = p.Elevation
-			case *ref-*p.Elevation >= elevationDeadband:
-				a.loss += *ref - *p.Elevation
-				ref = p.Elevation
-			}
+			g, l := track.step(p.Elevation)
+			a.gain += g
+			a.loss += l
 		}
 	}
+	return aggs
+}
 
-	out := make([]Split, count)
-	for k := range out {
-		startT := bounds[k]
-		endT := last.Duration
-		dist := remainder
+// buildSplits turns boundaries and totals into Split values. The first full
+// splits span splitMeters each; a final split, when present, spans remainder.
+func buildSplits(aggs []splitAgg, bounds []float64, endDuration, splitMeters float64, full int, remainder float64) []Split {
+	out := make([]Split, len(aggs))
+	for k, a := range aggs {
+		startT, endT, dist := bounds[k], endDuration, remainder
 		if k < full {
-			endT = bounds[k+1]
-			dist = splitMeters
+			endT, dist = bounds[k+1], splitMeters
 		}
 		sp := Split{
 			Index:         k + 1,
 			Distance:      dist,
 			Duration:      endT - startT,
-			ElevationGain: aggs[k].gain,
-			ElevationLoss: aggs[k].loss,
-			MaxHeartRate:  aggs[k].hrMax,
+			ElevationGain: a.gain,
+			ElevationLoss: a.loss,
+			MaxHeartRate:  a.hrMax,
 			Partial:       k >= full,
 		}
 		if sp.Duration > 0 {
 			sp.AvgSpeed = dist / sp.Duration
 		}
-		if aggs[k].hrN > 0 {
-			sp.AvgHeartRate = aggs[k].hrSum / float64(aggs[k].hrN)
+		if a.hrN > 0 {
+			sp.AvgHeartRate = a.hrSum / float64(a.hrN)
 		}
-		if aggs[k].cadN > 0 {
-			sp.AvgCadence = aggs[k].cadSum / float64(aggs[k].cadN)
+		if a.cadN > 0 {
+			sp.AvgCadence = a.cadSum / float64(a.cadN)
 		}
 		out[k] = sp
 	}
-	return out, nil
+	return out
 }
