@@ -1433,3 +1433,110 @@ func TestStressValues_MarshalIncludesOtherOnlyWhenPresent(t *testing.T) {
 		t.Errorf("json = %s", extra)
 	}
 }
+
+// --- Heart rate: abnormal-HR fields from Garmin's schema -----------------------
+
+func TestHeartRate_RealStringTimestampsAndNoAbnormalFields(t *testing.T) {
+	t.Parallel()
+	// The real response: plain strings for dates (the Swagger schema shows
+	// {date, localDate} objects), and no abnormal-HR keys at all.
+	c, last := serve(t, `{"userProfilePK":1,"calendarDate":"2026-11-15",
+	  "startTimestampGMT":"2026-11-14T22:00:00.0","endTimestampGMT":"2026-11-15T22:00:00.0",
+	  "startTimestampLocal":"2026-11-15T00:00:00.0","endTimestampLocal":"2026-11-16T00:00:00.0",
+	  "maxHeartRate":170,"minHeartRate":44,"restingHeartRate":50,"lastSevenDaysAvgRestingHeartRate":51,
+	  "heartRateValueDescriptors":[{"key":"timestamp","index":0},{"key":"heartrate","index":1}],
+	  "heartRateValues":[[1789000000000,60]]}`)
+	h, err := c.HeartRate(context.Background(), d2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.URL.Path != "/wellness-service/wellness/dailyHeartRate" || last.URL.Query().Get("date") != "2026-11-15" {
+		t.Errorf("request = %s?%s", last.URL.Path, last.URL.RawQuery)
+	}
+	if h.CalendarDate != "2026-11-15" || h.End.Sub(h.Start.Time) != 24*time.Hour || len(h.Samples) != 1 {
+		t.Errorf("day = %+v", h)
+	}
+	if h.AbnormalThreshold != 0 || h.LowAbnormalThreshold != 0 || len(h.Abnormal) != 0 {
+		t.Errorf("absent abnormal fields must be zero/empty: %+v", h)
+	}
+}
+
+func TestHeartRate_AbnormalFieldsFromSchema(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `{"calendarDate":"2026-11-15","abnormalHrThresholdValue":120,"lowAbnormalHrThresholdValue":40,
+	  "heartRateValueDescriptors":[{"key":"timestamp","index":0},{"key":"heartrate","index":1}],
+	  "heartRateValues":[[1789000000000,60]],
+	  "abnormalHRValuesArray":[[1789000060000,125],[1789000120000,null],[1789000180000,38]]}`)
+	h, err := c.HeartRate(context.Background(), d2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.AbnormalThreshold != 120 || h.LowAbnormalThreshold != 40 {
+		t.Errorf("thresholds = %d / %d", h.AbnormalThreshold, h.LowAbnormalThreshold)
+	}
+	if len(h.Abnormal) != 2 || h.Abnormal[0].BPM != 125 || h.Abnormal[1].BPM != 38 || h.Abnormal[0].Time.UnixMilli() != 1789000060000 {
+		t.Errorf("abnormal = %+v (null row must be skipped)", h.Abnormal)
+	}
+	if len(h.Samples) != 1 || h.Samples[0].BPM != 60 {
+		t.Errorf("normal samples disturbed: %+v", h.Samples)
+	}
+}
+
+// The abnormal array's real shape is unverified, so no shape of it may be
+// able to break decoding of the rest of the day.
+func TestHeartRate_UnexpectedAbnormalShapesDoNotBreakTheDay(t *testing.T) {
+	t.Parallel()
+	for name, abnormal := range map[string]string{
+		"null":             `null`,
+		"empty":            `[]`,
+		"objects not rows": `[{"time":1,"bpm":2}]`,
+		"rows of objects":  `[[{"a":1}]]`,
+		"a string":         `"none"`,
+		"a number":         `7`,
+		"short rows":       `[[1789000000000]]`,
+		"text cells":       `[["x","y"]]`,
+	} {
+		c, _ := serve(t, `{"calendarDate":"2026-11-15","restingHeartRate":50,
+		  "heartRateValues":[[1789000000000,61]],"abnormalHRValuesArray":`+abnormal+`}`)
+		h, err := c.HeartRate(context.Background(), d2)
+		if err != nil {
+			t.Errorf("%s: decode failed: %v", name, err)
+			continue
+		}
+		if h.Resting != 50 || len(h.Samples) != 1 || h.Samples[0].BPM != 61 {
+			t.Errorf("%s: rest of the day damaged: %+v", name, h)
+		}
+		if len(h.Abnormal) != 0 {
+			t.Errorf("%s: expected no abnormal samples, got %+v", name, h.Abnormal)
+		}
+	}
+}
+
+func TestHeartRate_ErrorsMatchTheDocumentedStatuses(t *testing.T) {
+	t.Parallel()
+	for status, want := range map[int]error{
+		http.StatusUnauthorized: garmin.ErrUnauthorized,
+		http.StatusForbidden:    garmin.ErrForbidden,
+	} {
+		c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+		if _, err := c.HeartRate(context.Background(), d2); !errors.Is(err, want) {
+			t.Errorf("HTTP %d: err = %v, want %v", status, err, want)
+		}
+	}
+	var calls int
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls++; calls == 1 {
+			w.WriteHeader(http.StatusInternalServerError) // documented 500, transient
+			return
+		}
+		_, _ = w.Write([]byte(`{"restingHeartRate":50}`))
+	}))
+	if h, err := c.HeartRate(context.Background(), d2); err != nil || h.Resting != 50 || calls != 2 {
+		t.Errorf("500 should be retried once: %+v err %v calls %d", h, err, calls)
+	}
+	c400 := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadRequest) }))
+	var apiErr *garmin.APIError
+	if _, err := c400.HeartRate(context.Background(), d2); !errors.As(err, &apiErr) || apiErr.StatusCode != 400 {
+		t.Errorf("400 err = %v", err)
+	}
+}

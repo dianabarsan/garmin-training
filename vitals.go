@@ -27,6 +27,16 @@ type HeartRateDay struct {
 	Max                     int               `json:"maxHeartRate"`
 	LastSevenDaysAvgResting int               `json:"lastSevenDaysAvgRestingHeartRate"`
 	Samples                 []HeartRateSample `json:"-"`
+
+	// AbnormalThreshold and LowAbnormalThreshold are the bpm limits behind
+	// abnormal heart-rate alerts, and Abnormal the readings that crossed them.
+	// Garmin's schema documents all three, but none of 30 recent days carried
+	// them (probably only sent when those alerts are enabled), so they are
+	// unverified: thresholds are 0 and Abnormal is empty when absent. Abnormal
+	// is read leniently, assuming the same [timestamp, bpm] rows as Samples.
+	AbnormalThreshold    int               `json:"abnormalHrThresholdValue"`
+	LowAbnormalThreshold int               `json:"lowAbnormalHrThresholdValue"`
+	Abnormal             []HeartRateSample `json:"-"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -36,24 +46,39 @@ func (h *HeartRateDay) UnmarshalJSON(b []byte) error {
 		*plain
 		Descriptors []valueDescriptor   `json:"heartRateValueDescriptors"`
 		Values      [][]json.RawMessage `json:"heartRateValues"`
+		// Kept raw so an unexpected shape cannot make the whole day fail.
+		AbnormalValues json.RawMessage `json:"abnormalHRValuesArray"`
 	}{plain: (*plain)(h)}
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
 	tsIdx := descriptorIndex(aux.Descriptors, "timestamp", 0)
 	hrIdx := descriptorIndex(aux.Descriptors, "heartrate", 1)
-	for _, row := range aux.Values {
+	h.Samples = heartRateSamples(aux.Values, tsIdx, hrIdx)
+
+	var abnormal [][]json.RawMessage
+	if json.Unmarshal(aux.AbnormalValues, &abnormal) == nil {
+		h.Abnormal = heartRateSamples(abnormal, tsIdx, hrIdx)
+	}
+	return nil
+}
+
+// heartRateSamples turns [timestamp, bpm] rows into samples, skipping rows with
+// a missing, null or non-numeric cell.
+func heartRateSamples(rows [][]json.RawMessage, tsIdx, hrIdx int) []HeartRateSample {
+	var out []HeartRateSample
+	for _, row := range rows {
 		ts, ok1 := numberAt(row, tsIdx)
 		hr, ok2 := numberAt(row, hrIdx)
 		if !ok1 || !ok2 {
 			continue
 		}
-		h.Samples = append(h.Samples, HeartRateSample{
+		out = append(out, HeartRateSample{
 			Time: Timestamp{time.UnixMilli(int64(ts)).UTC()},
 			BPM:  int(hr),
 		})
 	}
-	return nil
+	return out
 }
 
 // HeartRate returns heart-rate data for the given day.
