@@ -177,7 +177,13 @@ func (d *BodyBatteryDay) UnmarshalJSON(b []byte) error {
 }
 
 // BodyBattery returns Body Battery data for each day in [start, end].
+// Ranges longer than 31 days are fetched in several requests and joined.
 func (c *Client) BodyBattery(ctx context.Context, start, end time.Time) ([]BodyBatteryDay, error) {
+	return fetchRange(ctx, start, end, maxBodyBatteryDays, c.bodyBattery)
+}
+
+// bodyBattery fetches a single window that fits within Garmin's range cap.
+func (c *Client) bodyBattery(ctx context.Context, start, end time.Time) ([]BodyBatteryDay, error) {
 	if err := checkRange(start, end); err != nil {
 		return nil, err
 	}

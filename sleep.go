@@ -56,15 +56,41 @@ type Sleep struct {
 	NextSleepNeed *SleepNeed `json:"nextSleepNeed"`
 	// Alignment compares your sleep timing with Garmin's recommended window.
 	Alignment *SleepAlignment `json:"sleepAlignment"`
-	// Naps lists individual naps. Garmin's schema documents it but it was empty
-	// on every night checked, even ones with NapSeconds > 0, so treat it as
-	// unverified. AgeGroup is e.g. "ADULT".
+	// Naps lists individual naps. Only SleepRange fills it: the single-day Sleep
+	// call returns the NapSeconds total but not the list (checked on a day with
+	// a 44 minute nap), so use SleepRange with a one-day range to get naps.
+	// AgeGroup is e.g. "ADULT".
 	Naps     []SleepNap `json:"dailyNapDTOS"`
 	AgeGroup string     `json:"ageGroup"`
 	// UserNote is the free-text note you attached to the night, if any.
 	UserNote     string `json:"userNote"`
 	SleepVersion int    `json:"sleepVersion"`
 }
+
+// UnmarshalJSON implements json.Unmarshaler. Garmin returns a record for days
+// that have naps or sleep-need guidance but no main sleep, with id 0 and an
+// empty calendarDate. Those carry real data, so they are kept, and the date is
+// taken from the nested sleep-need block (or the first nap) so entries still
+// sort and join by day.
+func (s *Sleep) UnmarshalJSON(b []byte) error {
+	type plain Sleep // drops methods, avoiding recursion
+	if err := json.Unmarshal(b, (*plain)(s)); err != nil {
+		return err
+	}
+	if s.CalendarDate == "" {
+		switch {
+		case s.SleepNeed != nil && s.SleepNeed.CalendarDate != "":
+			s.CalendarDate = s.SleepNeed.CalendarDate
+		case len(s.Naps) > 0 && s.Naps[0].CalendarDate != "":
+			s.CalendarDate = s.Naps[0].CalendarDate
+		}
+	}
+	return nil
+}
+
+// HasSleep reports whether Garmin recorded a main sleep. It is false for days
+// that only carry naps or sleep-need guidance; check NapSeconds and Naps there.
+func (s Sleep) HasSleep() bool { return s.ID != 0 || !s.Start.IsZero() }
 
 // SleepScore is one component of the sleep score: a 0-100 value where Garmin
 // scores one, its qualifier (e.g. "GOOD"), and the optimal range for it.
@@ -119,16 +145,18 @@ type SleepAlignment struct {
 	LastSleepMidpointMins  int    `json:"lastSleepMidpointMins"`
 }
 
-// SleepNap is one nap, as documented by Garmin's schema.
+// SleepNap is one nap.
 type SleepNap struct {
-	Start    Timestamp `json:"napStartTimestampGMT"`
-	End      Timestamp `json:"napEndTimestampGMT"`
-	Seconds  int       `json:"napTimeSec"`
-	Feedback string    `json:"napFeedback"`
+	CalendarDate string    `json:"calendarDate"`
+	Start        Timestamp `json:"napStartTimestampGMT"`
+	End          Timestamp `json:"napEndTimestampGMT"`
+	Seconds      int       `json:"napTimeSec"`
+	Feedback     string    `json:"napFeedback"`
 }
 
 // Sleep returns the sleep summary for the night ending on date. When Garmin
-// has no sleep for the date it returns the zero Sleep.
+// has no sleep for the date it returns the zero Sleep. It does not include the
+// list of naps, only their NapSeconds total; SleepRange does.
 func (c *Client) Sleep(ctx context.Context, date time.Time) (Sleep, error) {
 	var raw json.RawMessage
 	q := url.Values{"date": {dateParam(date)}}
@@ -142,8 +170,16 @@ func (c *Client) Sleep(ctx context.Context, date time.Time) (Sleep, error) {
 	return s, nil
 }
 
-// SleepRange returns sleep summaries for each night in [start, end].
+// SleepRange returns sleep summaries for each day in [start, end]. Days with
+// naps or sleep-need guidance but no main sleep are included (see
+// Sleep.HasSleep); days with nothing at all are absent.
+// Ranges longer than 31 days are fetched in several requests and joined.
 func (c *Client) SleepRange(ctx context.Context, start, end time.Time) ([]Sleep, error) {
+	return fetchRange(ctx, start, end, maxSleepRangeDays, c.sleepRange)
+}
+
+// sleepRange fetches a single window that fits within Garmin's range cap.
+func (c *Client) sleepRange(ctx context.Context, start, end time.Time) ([]Sleep, error) {
 	if err := checkRange(start, end); err != nil {
 		return nil, err
 	}

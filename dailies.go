@@ -123,7 +123,13 @@ func (d *DailySummary) UnmarshalJSON(b []byte) error {
 // DailySummaries returns one summary per day in [start, end], inclusive.
 // Days are interpreted by their calendar date in the location of the times
 // you pass.
+// Ranges longer than 300 days are fetched in several requests and joined.
 func (c *Client) DailySummaries(ctx context.Context, start, end time.Time) ([]DailySummary, error) {
+	return fetchRange(ctx, start, end, maxDailySummaryDays, c.dailySummaries)
+}
+
+// dailySummaries fetches a single window that fits within Garmin's range cap.
+func (c *Client) dailySummaries(ctx context.Context, start, end time.Time) ([]DailySummary, error) {
 	if err := checkRange(start, end); err != nil {
 		return nil, err
 	}
@@ -153,7 +159,13 @@ type StepsDay struct {
 }
 
 // Steps returns daily step totals in [start, end].
+// Ranges longer than 28 days are fetched in several requests and joined.
 func (c *Client) Steps(ctx context.Context, start, end time.Time) ([]StepsDay, error) {
+	return fetchRange(ctx, start, end, maxStepsDays, c.steps)
+}
+
+// steps fetches a single window that fits within Garmin's range cap.
+func (c *Client) steps(ctx context.Context, start, end time.Time) ([]StepsDay, error) {
 	if err := checkRange(start, end); err != nil {
 		return nil, err
 	}
@@ -165,21 +177,69 @@ func (c *Client) Steps(ctx context.Context, start, end time.Time) ([]StepsDay, e
 	return out, nil
 }
 
-// StressDay is one day of the stress statistics endpoint. Durations are
-// seconds; OverallLevel is Garmin's 0-100 score.
+// StressDay is one day of the stress statistics endpoint.
 type StressDay struct {
-	CalendarDate string `json:"calendarDate"`
-	Values       struct {
-		OverallLevel  int `json:"overallStressLevel"`
-		RestSeconds   int `json:"restStressDuration"`
-		LowSeconds    int `json:"lowStressDuration"`
-		MediumSeconds int `json:"mediumStressDuration"`
-		HighSeconds   int `json:"highStressDuration"`
-	} `json:"values"`
+	CalendarDate string       `json:"calendarDate"`
+	Values       StressValues `json:"values"`
+}
+
+// StressValues are a day's stress figures. Durations are seconds (verified
+// against the daily summary's millisecond figures) and OverallLevel is Garmin's
+// 0-100 score. Garmin documents the underlying object as an open map, so any
+// numeric key beyond the five known ones is kept in Other instead of dropped.
+type StressValues struct {
+	OverallLevel  int `json:"overallStressLevel"`
+	RestSeconds   int `json:"restStressDuration"`
+	LowSeconds    int `json:"lowStressDuration"`
+	MediumSeconds int `json:"mediumStressDuration"`
+	HighSeconds   int `json:"highStressDuration"`
+	// Other holds additional numeric keys by their Garmin name; nil when none.
+	Other map[string]float64 `json:"other,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler. Non-numeric values are ignored.
+func (v *StressValues) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	*v = StressValues{}
+	for k, raw := range m {
+		var f float64
+		// Unmarshalling null into a float succeeds and yields 0, so check for it
+		// explicitly or a null would be recorded as a real zero.
+		if string(raw) == "null" || json.Unmarshal(raw, &f) != nil {
+			continue
+		}
+		switch k {
+		case "overallStressLevel":
+			v.OverallLevel = int(f)
+		case "restStressDuration":
+			v.RestSeconds = int(f)
+		case "lowStressDuration":
+			v.LowSeconds = int(f)
+		case "mediumStressDuration":
+			v.MediumSeconds = int(f)
+		case "highStressDuration":
+			v.HighSeconds = int(f)
+		default:
+			if v.Other == nil {
+				v.Other = map[string]float64{}
+			}
+			v.Other[k] = f
+		}
+	}
+	return nil
 }
 
 // Stress returns daily stress statistics in [start, end].
+// Ranges longer than 28 days are fetched in several requests and joined.
 func (c *Client) Stress(ctx context.Context, start, end time.Time) ([]StressDay, error) {
+	return fetchRange(ctx, start, end, maxStressDays, c.stress)
+}
+
+// stress fetches a single window that fits within Garmin's range cap.
+func (c *Client) stress(ctx context.Context, start, end time.Time) ([]StressDay, error) {
 	if err := checkRange(start, end); err != nil {
 		return nil, err
 	}

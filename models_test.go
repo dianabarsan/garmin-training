@@ -1102,3 +1102,334 @@ func TestSleepRange_SharesTheFullModel(t *testing.T) {
 		t.Errorf("range = %+v err %v", got, err)
 	}
 }
+
+// --- Long ranges are split to fit Garmin's per-endpoint caps -----------------
+
+// windowRecorder answers every request with one entry per window, recording
+// the window each request asked for.
+type windowRecorder struct {
+	windows [][2]string
+}
+
+func (r *windowRecorder) handler(startKey, endKey string, body func(start string) string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var s, e string
+		if startKey != "" {
+			s, e = req.URL.Query().Get(startKey), req.URL.Query().Get(endKey)
+		} else { // dates embedded in the path: .../daily/{start}/{end}
+			parts := strings.Split(strings.TrimRight(req.URL.Path, "/"), "/")
+			s, e = parts[len(parts)-2], parts[len(parts)-1]
+		}
+		r.windows = append(r.windows, [2]string{s, e})
+		_, _ = w.Write([]byte(body(s)))
+	})
+}
+
+func (r *windowRecorder) summary() string {
+	parts := make([]string, len(r.windows))
+	for i, w := range r.windows {
+		parts[i] = w[0] + ".." + w[1]
+	}
+	return strings.Join(parts, " ")
+}
+
+func day(s string) time.Time {
+	t, _ := time.Parse(time.DateOnly, s)
+	return t
+}
+
+func TestSleepRange_SplitsAt31Days(t *testing.T) {
+	t.Parallel()
+	rec := &windowRecorder{}
+	c := newTestClient(t, rec.handler("startDate", "endDate", func(s string) string {
+		return `[{"id":1,"calendarDate":"` + s + `"}]`
+	}))
+	got, err := c.SleepRange(context.Background(), day("2026-09-01"), day("2026-11-09")) // 70 days
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "2026-09-01..2026-10-01 2026-10-02..2026-11-01 2026-11-02..2026-11-09"
+	if rec.summary() != want {
+		t.Errorf("requests = %s\nwant       %s", rec.summary(), want)
+	}
+	if len(got) != 3 || got[0].CalendarDate != "2026-09-01" || got[1].CalendarDate != "2026-10-02" || got[2].CalendarDate != "2026-11-02" {
+		t.Errorf("results not joined in order: %+v", got)
+	}
+}
+
+func TestStepsAndStress_SplitAt28Days(t *testing.T) {
+	t.Parallel()
+	for name, call := range map[string]func(c *garmin.Client) (int, error){
+		"steps": func(c *garmin.Client) (int, error) {
+			r, err := c.Steps(context.Background(), day("2026-09-01"), day("2026-10-30"))
+			return len(r), err
+		},
+		"stress": func(c *garmin.Client) (int, error) {
+			r, err := c.Stress(context.Background(), day("2026-09-01"), day("2026-10-30"))
+			return len(r), err
+		},
+	} {
+		rec := &windowRecorder{}
+		c := newTestClient(t, rec.handler("", "", func(s string) string { return `[{"calendarDate":"` + s + `"}]` }))
+		n, err := call(c)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := "2026-09-01..2026-09-28 2026-09-29..2026-10-26 2026-10-27..2026-10-30" // 28 + 28 + 4
+		if rec.summary() != want || n != 3 {
+			t.Errorf("%s: requests = %s (n=%d)\nwant %s", name, rec.summary(), n, want)
+		}
+	}
+}
+
+func TestBodyBattery_SplitsAt31Days(t *testing.T) {
+	t.Parallel()
+	rec := &windowRecorder{}
+	c := newTestClient(t, rec.handler("startDate", "endDate", func(s string) string { return `[{"date":"` + s + `"}]` }))
+	got, err := c.BodyBattery(context.Background(), day("2026-09-01"), day("2026-11-01")) // 62 days
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "2026-09-01..2026-10-01 2026-10-02..2026-11-01"; rec.summary() != want || len(got) != 2 {
+		t.Errorf("requests = %s (n=%d), want %s", rec.summary(), len(got), want)
+	}
+}
+
+func TestDailySummaries_SplitAt300Days(t *testing.T) {
+	t.Parallel()
+	rec := &windowRecorder{}
+	c := newTestClient(t, rec.handler("startDate", "endDate", func(s string) string {
+		return `{"data":[{"calendarDate":"` + s + `"}]}`
+	}))
+	got, err := c.DailySummaries(context.Background(), day("2025-01-01"), day("2026-11-15")) // 684 days
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.windows) != 3 || rec.windows[0] != [2]string{"2025-01-01", "2025-10-27"} || rec.windows[2][1] != "2026-11-15" || len(got) != 3 {
+		t.Errorf("requests = %s (n=%d)", rec.summary(), len(got))
+	}
+}
+
+func TestRangeSplitting_ShortRangesAreOneRequest(t *testing.T) {
+	t.Parallel()
+	rec := &windowRecorder{}
+	c := newTestClient(t, rec.handler("startDate", "endDate", func(string) string { return `[]` }))
+	if _, err := c.SleepRange(context.Background(), day("2026-11-01"), day("2026-11-15")); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.windows) != 1 || rec.windows[0] != [2]string{"2026-11-01", "2026-11-15"} {
+		t.Errorf("requests = %s", rec.summary())
+	}
+}
+
+func TestRangeSplitting_StopsAtFirstError(t *testing.T) {
+	t.Parallel()
+	var calls int
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 2 {
+			http.Error(w, "boom", http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte(`[{"id":1}]`))
+	}))
+	got, err := c.SleepRange(context.Background(), day("2026-01-01"), day("2026-12-31"))
+	if !errors.Is(err, garmin.ErrForbidden) || got != nil {
+		t.Errorf("got %v err %v", got, err)
+	}
+	if calls != 2 {
+		t.Errorf("requests after the failure: calls = %d, want 2", calls)
+	}
+}
+
+func TestRangeSplitting_RespectsCancellationAndValidation(t *testing.T) {
+	t.Parallel()
+	var calls int
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Steps(ctx, day("2026-01-01"), day("2026-12-31")); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled err = %v", err)
+	}
+	if _, err := c.Steps(context.Background(), day("2026-12-31"), day("2026-01-01")); !errors.Is(err, garmin.ErrInvalidRange) {
+		t.Errorf("reversed err = %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("no request should be sent for a cancelled or invalid call (calls=%d)", calls)
+	}
+}
+
+// --- Sleep records without a main sleep (naps / sleep-need only) -------------
+
+// The shape Garmin returns for a day with a nap but no main sleep: id 0, an
+// empty calendarDate, and the real date only inside the nested blocks.
+const napOnlyDayJSON = `{"id":0,"calendarDate":"","napTimeSeconds":2640,
+  "dailyNapDTOS":[{"calendarDate":"2026-06-11","napTimeSec":2640,"napStartTimestampGMT":"2026-06-11T10:51:08",
+    "napEndTimestampGMT":"2026-06-11T11:35:08","napFeedback":"LONG_DURATION_LOW_NEED","napSource":0,"createTimestampGMT":null}],
+  "sleepNeed":{"calendarDate":"2026-06-11","baseline":420,"actual":440,"feedback":"INCREASED"},
+  "nextSleepNeed":{"calendarDate":"2026-06-12","baseline":420,"actual":420,"feedback":"NO_CHANGE_BALANCED"}}`
+
+// A one-day SleepRange is how to get a day's individual naps; this pins the
+// documented workaround.
+func TestSleepRange_OneDayRangeReturnsNaps(t *testing.T) {
+	t.Parallel()
+	c, last := serve(t, "["+napOnlyDayJSON+"]")
+	got, err := c.SleepRange(context.Background(), day("2026-06-11"), day("2026-06-11"))
+	if err != nil || len(got) != 1 || len(got[0].Naps) != 1 {
+		t.Fatalf("got %+v err %v", got, err)
+	}
+	if q := last.URL.Query(); q.Get("startDate") != "2026-06-11" || q.Get("endDate") != "2026-06-11" {
+		t.Errorf("query = %v", q)
+	}
+}
+
+func TestSleep_NapOnlyDayIsKeptAndDated(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, napOnlyDayJSON)
+	s, err := c.Sleep(context.Background(), day("2026-06-11"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.HasSleep() {
+		t.Error("a nap-only day has no main sleep")
+	}
+	if s.CalendarDate != "2026-06-11" {
+		t.Errorf("CalendarDate = %q, want the date from sleepNeed (not nextSleepNeed's 2026-06-12)", s.CalendarDate)
+	}
+	if s.NapSeconds != 2640 || len(s.Naps) != 1 {
+		t.Fatalf("naps = %+v (NapSeconds %d)", s.Naps, s.NapSeconds)
+	}
+	n := s.Naps[0]
+	if n.CalendarDate != "2026-06-11" || n.Seconds != 2640 || n.Feedback != "LONG_DURATION_LOW_NEED" {
+		t.Errorf("nap = %+v", n)
+	}
+	if want := time.Date(2026, 6, 11, 10, 51, 8, 0, time.UTC); !n.Start.Equal(want) || n.End.Sub(n.Start.Time) != 44*time.Minute {
+		t.Errorf("nap times = %v .. %v", n.Start.Time, n.End.Time)
+	}
+	if s.SleepNeed == nil || s.SleepNeed.ActualMins != 440 || s.NextSleepNeed == nil || s.NextSleepNeed.ActualMins != 420 {
+		t.Errorf("need blocks lost: %+v / %+v", s.SleepNeed, s.NextSleepNeed)
+	}
+	if !strings.Contains(string(s.Raw()), "dailyNapDTOS") {
+		t.Error("raw not retained")
+	}
+}
+
+func TestSleep_DateFallbackOrder(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, body, want string
+	}{
+		{"keeps its own date", `{"id":1,"calendarDate":"2026-03-03","sleepNeed":{"calendarDate":"2026-03-04"}}`, "2026-03-03"},
+		{"falls back to sleepNeed", `{"id":0,"calendarDate":"","sleepNeed":{"calendarDate":"2026-03-04"}}`, "2026-03-04"},
+		{"then to the first nap", `{"id":0,"dailyNapDTOS":[{"calendarDate":"2026-03-05"}]}`, "2026-03-05"},
+		{"stays empty with nothing to go on", `{"id":0}`, ""},
+	}
+	for _, tc := range tests {
+		c, _ := serve(t, tc.body)
+		s, err := c.Sleep(context.Background(), d2)
+		if err != nil || s.CalendarDate != tc.want {
+			t.Errorf("%s: CalendarDate = %q (err %v), want %q", tc.name, s.CalendarDate, err, tc.want)
+		}
+	}
+}
+
+func TestSleep_HasSleep(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, sleepJSON)
+	s, err := c.Sleep(context.Background(), d2)
+	if err != nil || !s.HasSleep() {
+		t.Errorf("a recorded night must report HasSleep: %+v err %v", s, err)
+	}
+	if (garmin.Sleep{}).HasSleep() {
+		t.Error("the zero Sleep (no data / HTTP 204) must not claim sleep")
+	}
+}
+
+func TestSleepRange_NapOnlyDaysSortInPlace(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `[{"id":1,"calendarDate":"2026-06-10"},`+napOnlyDayJSON+`,{"id":3,"calendarDate":"2026-06-12"}]`)
+	got, err := c.SleepRange(context.Background(), day("2026-06-10"), day("2026-06-12"))
+	if err != nil || len(got) != 3 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	dates := []string{got[0].CalendarDate, got[1].CalendarDate, got[2].CalendarDate}
+	if strings.Join(dates, ",") != "2026-06-10,2026-06-11,2026-06-12" {
+		t.Errorf("dates = %v, want ascending with the nap-only day dated", dates)
+	}
+	if got[1].HasSleep() || !got[0].HasSleep() || !got[2].HasSleep() {
+		t.Error("HasSleep wrong across the range")
+	}
+}
+
+// --- Stress values are an open map in Garmin's schema -------------------------
+
+func TestStress_KnownKeysAndUnitsDecode(t *testing.T) {
+	t.Parallel()
+	c, last := serve(t, `[{"calendarDate":"2026-11-14","values":{"overallStressLevel":33,"restStressDuration":30000,
+	  "lowStressDuration":20000,"mediumStressDuration":9000,"highStressDuration":1200}}]`)
+	got, err := c.Stress(context.Background(), day("2026-11-14"), day("2026-11-14"))
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	if last.URL.Path != "/usersummary-service/stats/stress/daily/2026-11-14/2026-11-14" {
+		t.Errorf("path = %s", last.URL.Path)
+	}
+	v := got[0].Values
+	if got[0].CalendarDate != "2026-11-14" || v.OverallLevel != 33 || v.RestSeconds != 30000 || v.LowSeconds != 20000 || v.MediumSeconds != 9000 || v.HighSeconds != 1200 {
+		t.Errorf("values = %+v", v)
+	}
+	if v.Other != nil {
+		t.Errorf("Other must be nil when there are no extra keys: %v", v.Other)
+	}
+}
+
+func TestStress_UnknownKeysAreKeptNotDropped(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `[{"calendarDate":"2026-11-14","values":{"overallStressLevel":40,"activityStressDuration":600,
+	  "uncategorizedStressDuration":120.5,"note":"text","missing":null,"flag":true}}]`)
+	got, err := c.Stress(context.Background(), day("2026-11-14"), day("2026-11-14"))
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %d err %v", len(got), err)
+	}
+	v := got[0].Values
+	if v.OverallLevel != 40 {
+		t.Errorf("known key lost: %+v", v)
+	}
+	if len(v.Other) != 2 || v.Other["activityStressDuration"] != 600 || v.Other["uncategorizedStressDuration"] != 120.5 {
+		t.Errorf("Other = %v, want the two numeric unknown keys only (text, null and bool ignored)", v.Other)
+	}
+}
+
+func TestStress_EmptyOrNullValuesDecode(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`[{"calendarDate":"2026-11-14","values":{}}]`,
+		`[{"calendarDate":"2026-11-14","values":null}]`,
+		`[{"calendarDate":"2026-11-14"}]`,
+	} {
+		c, _ := serve(t, body)
+		got, err := c.Stress(context.Background(), day("2026-11-14"), day("2026-11-14"))
+		if err != nil || len(got) != 1 || got[0].Values.OverallLevel != 0 || got[0].Values.Other != nil {
+			t.Errorf("body %s: %+v err %v", body, got, err)
+		}
+	}
+	bad, _ := serve(t, `[{"calendarDate":"2026-11-14","values":"oops"}]`)
+	if _, err := bad.Stress(context.Background(), day("2026-11-14"), day("2026-11-14")); err == nil {
+		t.Error("values of the wrong JSON type must be an error")
+	}
+}
+
+func TestStressValues_MarshalIncludesOtherOnlyWhenPresent(t *testing.T) {
+	t.Parallel()
+	plain, _ := json.Marshal(garmin.StressValues{OverallLevel: 30})
+	if strings.Contains(string(plain), "other") {
+		t.Errorf("empty Other must be omitted: %s", plain)
+	}
+	extra, _ := json.Marshal(garmin.StressValues{Other: map[string]float64{"x": 1}})
+	if !strings.Contains(string(extra), `"other":{"x":1}`) {
+		t.Errorf("json = %s", extra)
+	}
+}
