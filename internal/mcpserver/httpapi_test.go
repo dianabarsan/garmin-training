@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -161,10 +162,10 @@ func TestAuthEndpoint_KeyNeverLeaks(t *testing.T) {
 	const badKey = "wrong-key-SECRETVALUE-987"
 
 	var seen strings.Builder
-	record := func(code int, body string, hdr http.Header) {
+	record := func(body string, hdr http.Header) {
 		seen.WriteString(body)
 		for k, v := range hdr {
-			seen.WriteString(k + ": " + strings.Join(v, ",") + "\n")
+			fmt.Fprintf(&seen, "%s: %s\n", k, strings.Join(v, ","))
 		}
 	}
 	for _, step := range []struct{ method, ctype, body string }{
@@ -176,19 +177,18 @@ func TestAuthEndpoint_KeyNeverLeaks(t *testing.T) {
 		{"GET", "", ""},
 		{"DELETE", "", ""},
 	} {
-		code, body, hdr := do(t, step.method, base+"/auth", step.ctype, step.body, nil)
-		_ = code
-		record(code, body, hdr)
+		_, body, hdr := do(t, step.method, base+"/auth", step.ctype, step.body, nil)
+		record(body, hdr)
 	}
 	for _, f := range []string{"/", "/healthz"} {
-		code, body, hdr := do(t, "GET", base+f, "", "", nil)
-		record(code, body, hdr)
+		_, body, hdr := do(t, "GET", base+f, "", "", nil)
+		record(body, hdr)
 	}
 	// And through tool results.
 	h.authenticate(t)
 	cs := h.connect(t)
-	record(0, resultText(callTool(t, cs, "auth_status", nil)), nil)
-	record(0, resultText(callTool(t, cs, "get_steps", map[string]any{"start": "nonsense"})), nil)
+	record(resultText(callTool(t, cs, "auth_status", nil)), nil)
+	record(resultText(callTool(t, cs, "get_steps", map[string]any{"start": "nonsense"})), nil)
 
 	for _, secret := range []string{badKey, validKey, "SECRETVALUE"} {
 		if strings.Contains(seen.String(), secret) {

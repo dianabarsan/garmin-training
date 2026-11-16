@@ -175,11 +175,11 @@ func (s *Server) userError(err error) error {
 	case errors.Is(err, ErrNotAuthenticated):
 		return errors.New("no Garmin API key has been provided. " + capitalize(s.askUserToProvideKey()) + ", then retry")
 	case errors.Is(err, auth.ErrInvalidKey), errors.Is(err, garmin.ErrUnauthorized):
-		return errors.New("Garmin rejected the API key; it has probably expired or been deleted. " + capitalize(s.askUserForNewKey()))
+		return errors.New("the Garmin API key was rejected; it has probably expired or been deleted. " + capitalize(s.askUserForNewKey()))
 	case errors.Is(err, garmin.ErrRateLimited):
-		return errors.New("Garmin is rate limiting requests; wait a little and retry")
+		return errors.New("the Garmin API is rate limiting requests; wait a little and retry")
 	case errors.Is(err, garmin.ErrNotFound):
-		return errors.New("Garmin has nothing for that request (not found); check the id or date")
+		return errors.New("not found: Garmin has nothing for that request; check the id or date")
 	case errors.Is(err, garmin.ErrNoDistance):
 		return errors.New("this activity has no distance data (for example strength training or an indoor workout), so it cannot be split by distance")
 	}

@@ -45,7 +45,7 @@ func fakeGarmin(t *testing.T) (*httptest.Server, *atomic.Int32) {
 				http.Error(w, "no", http.StatusUnauthorized)
 				return
 			}
-			jwt := enc([]byte(`{"alg":"none"}`)) + "." + enc([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(24*time.Hour).Unix()))) + ".s"
+			jwt := enc([]byte(`{"alg":"none"}`)) + "." + enc(fmt.Appendf(nil, `{"exp":%d}`, time.Now().Add(24*time.Hour).Unix())) + ".s"
 			_, _ = w.Write([]byte(jwt))
 		case "/usersummary-service/stats/steps/daily/" + time.Now().AddDate(0, 0, -6).Format(time.DateOnly) + "/" + time.Now().Format(time.DateOnly):
 			_, _ = w.Write([]byte(`[{"calendarDate":"2026-11-16","totalSteps":4321,"stepGoal":8000,"totalDistance":3000}]`))

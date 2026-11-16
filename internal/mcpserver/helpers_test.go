@@ -28,7 +28,7 @@ var fixedNow = time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 
 func makeJWT(exp time.Time) string {
 	enc := base64.RawURLEncoding.EncodeToString
-	return enc([]byte(`{"alg":"none"}`)) + "." + enc([]byte(fmt.Sprintf(`{"exp":%d}`, exp.Unix()))) + ".sig"
+	return enc([]byte(`{"alg":"none"}`)) + "." + enc(fmt.Appendf(nil, `{"exp":%d}`, exp.Unix())) + ".sig"
 }
 
 // fakeGarmin stands in for Garmin's Personal API.
