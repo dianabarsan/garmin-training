@@ -41,11 +41,21 @@ Let's Encrypt. Nothing else needs to be open: the admin port is bound to loopbac
 ```sh
 mkdir -p secrets && chmod 700 secrets
 openssl rand -hex 32 > secrets/mcp_token          # the password Claude will send
-read -rs -p 'Garmin API key: ' KEY; echo
+printf 'Garmin API key: '; read -rs KEY; echo
 printf '%s' "$KEY" > secrets/garmin_key; unset KEY
 chmod 444 secrets/*                               # see the note below
 cp .env.example .env && $EDITOR .env              # set MCP_DOMAIN
 ```
+
+If your key is already in a file, use it instead of the `printf`/`read` lines. Copy the
+file to the server first (for example with `scp`), and delete that copy once the secret is
+in place:
+
+```sh
+tr -d '[:space:]' < /path/to/keyfile > secrets/garmin_key
+```
+
+(The server trims whitespace itself, so a plain `cp` works too.)
 
 The files are mode `444` inside a `700` directory on purpose: the container runs as an
 unprivileged user that has to read them, while other users on the host cannot get into

@@ -22,10 +22,24 @@ terminal (the key goes through stdin so it stays out of your shell history and p
 list):
 
 ```sh
-read -rs -p 'Garmin API key: ' KEY; echo
+printf 'Garmin API key: '; read -rs KEY; echo
 printf '{"api_key":"%s"}' "$KEY" | curl -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/auth
 unset KEY
 ```
+
+**If your key is already saved in a file**, send it from there instead of typing it. In
+this repository that file is `key` in the root (it is git-ignored); use the path to
+yours:
+
+```sh
+printf '{"api_key":"%s"}' "$(tr -d '[:space:]' < key)" | curl -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/auth
+```
+
+The shell reads the file, and `printf` is a shell builtin, so the key never appears on a
+command line or in the process list. `tr` strips the trailing newline and any stray
+whitespace, so the file just needs to hold the key. Keep it private (`chmod 600 key`) and
+never commit it. If the path is wrong the server answers `400` (`api_key is required`)
+and nothing changes.
 
 Garmin checks the key first. A wrong one is refused (`401`) and changes nothing. Check
 the state at any time with `curl -s http://127.0.0.1:8808/auth`; it never shows the key.
@@ -118,10 +132,17 @@ docker run -d --name garmin-mcp --restart unless-stopped \
   -v garmin-mcp-data:/data \
   --read-only --cap-drop ALL --security-opt no-new-privileges garmin-mcp
 
-read -rs -p 'Garmin API key: ' KEY; echo
+printf 'Garmin API key: '; read -rs KEY; echo
 printf '{"api_key":"%s"}' "$KEY" | curl -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/auth
 unset KEY
+```
+
+Or, if the key is in a file (see section 1):
+
+```sh
+printf '{"api_key":"%s"}' "$(tr -d '[:space:]' < key)" | curl -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/auth
 ```
 
 The key is kept in the `garmin-mcp-data` volume, so a new container with the same volume
