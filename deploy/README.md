@@ -130,8 +130,64 @@ in the conversation.
   `/data` volume is already writable); it is not rotated.
 - **What the server refuses:** requests for any hostname other than yours, any request
   without the token, and (at Caddy) every path except `/mcp`.
-- **Garmin's terms:** the Personal API is for your own data only. Do not share this
-  server with other people.
+- **Garmin's terms:** the Personal API is for people's own data and, per Garmin's FAQ, "not
+  intended for commercial applications serving multiple end users". As set up here the
+  server is for you alone. Serving other people is the optional multi-user mode described
+  below; read Garmin's terms first.
+
+## Serving more than one person (optional)
+
+The server can serve several people, each with their own Garmin key and their own token;
+see "Multiple users" in the main README for what it does and how it protects them. To use
+it here:
+
+1. Create two more secrets next to the others, with `chmod 444`:
+   `openssl rand -hex 24 > secrets/admin_token` and
+   `openssl rand -hex 32 > secrets/master_key`. **Back up `master_key` somewhere safe**:
+   without it the stored Garmin keys cannot be decrypted.
+2. Declare them in `compose.yaml` under `secrets:` and in the `garmin-mcp` service's
+   `secrets:` list, and replace the single-user environment with:
+
+   ```yaml
+   environment:
+     GARMIN_MCP_ALLOWED_HOSTS: ${MCP_DOMAIN:?set MCP_DOMAIN in deploy/.env}
+     GARMIN_MCP_USERS_FILE: /data/users.json
+     GARMIN_MCP_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+     GARMIN_MCP_MASTER_KEY_FILE: /run/secrets/master_key
+   ```
+
+   Drop `GARMIN_MCP_TOKEN_FILE` and `GARMIN_PERSONAL_API_KEY_FILE`, and the `garmin_key`
+   and `mcp_token` secrets, and **override the service's command** so it no longer passes
+   `-key-store` (the image's default does, and multi-user mode refuses to start with it):
+
+   ```yaml
+   command: ["-addr", ":8808"]
+   ```
+
+   The server refuses to start if any single-user setting is mixed in, and says which.
+3. Register people **on the server**, through the loopback-only admin port (use an SSH
+   tunnel from your own machine). Caddy forwards only `/mcp`, so `/admin` is not reachable
+   from the internet:
+
+   ```sh
+   ssh -L 8808:127.0.0.1:8808 you@server
+   # then, locally:
+   printf '{"name":"alice","api_key":"%s"}' "$ALICE_KEY" | curl -H "Authorization: Bearer $(ssh you@server cat deploy/secrets/admin_token)" \
+     -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/admin/users
+   ```
+
+   Give each person the token from the response; they add the connector exactly as in
+   step 7 above, with their own token.
+
+The users file lives in the `/data` volume (`docker compose down -v` deletes it, with every
+registration).
+
+What was tested: the image run with `docker run` using the same hardening and settings as
+the Compose file (read-only filesystem, no capabilities, secrets from files, the `/data`
+volume, the `command` override above). Registering a user, using their token, a container
+restart, and the file permissions and contents of `users.json` were all checked, and no secret
+appeared in the logs or in `docker inspect`. The edited `compose.yaml` and Caddy in front of it
+were **not** run in this configuration; rehearse it locally first (see below).
 
 ## Try it locally first
 

@@ -205,7 +205,25 @@ Things to know:
 - If you start the tunnel without `-disable-auth-endpoint`, the whole server is exposed,
   including `/auth`, protected only by the token.
 
-## 8. Stopping and removing
+## 8. Serving several people from your machine (optional)
+
+For you alone, skip this. To let others use their own Garmin keys, run in multi-user mode
+(see "Multiple users" in the main README for the details and the Garmin terms caveat):
+
+```sh
+export GARMIN_MCP_ADMIN_TOKEN=$(openssl rand -hex 24)
+export GARMIN_MCP_MASTER_KEY=$(openssl rand -hex 32)   # write it down: it decrypts the stored keys
+garmin-mcp -users-file ~/.config/garmin-mcp/users.json
+```
+
+Register a person with `POST /admin/users` (their Garmin key in, their token out, shown
+once), and they connect to `/mcp` with that token. The server will not start in this mode if
+you also pass `-token`, `-key-store`, `-disable-auth-endpoint` or `GARMIN_PERSONAL_API_KEY`.
+Keep both exported values: lose the admin token and you can rotate it (restart with a new
+one), lose the master key and the stored Garmin keys are unrecoverable, so everyone must be
+registered again.
+
+## 9. Stopping and removing
 
 | What | How |
 |---|---|

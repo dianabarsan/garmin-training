@@ -30,25 +30,30 @@ func (f *FileKeyStore) Load() (string, bool, error) {
 }
 
 // Save implements KeyStore. The write is atomic and the file is created 0600.
-func (f *FileKeyStore) Save(key string) error {
-	dir := filepath.Dir(f.path)
+func (f *FileKeyStore) Save(key string) error { return writeFileAtomic(f.path, []byte(key+"\n")) }
+
+// writeFileAtomic writes data to path so that a crash cannot leave a half-written
+// file: it writes a private (0600) temporary file in the same directory and
+// renames it into place. Missing parent directories are created 0700.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("creating key dir: %w", err)
+		return fmt.Errorf("creating directory: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".key-*") // 0600
+	tmp, err := os.CreateTemp(dir, ".tmp-*") // created 0600
 	if err != nil {
-		return fmt.Errorf("creating temp key file: %w", err)
+		return fmt.Errorf("creating temporary file: %w", err)
 	}
 	defer os.Remove(tmp.Name()) // no-op after a successful rename
-	if _, err := tmp.WriteString(key + "\n"); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		return fmt.Errorf("writing key: %w", err)
+		return fmt.Errorf("writing: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing key file: %w", err)
+		return fmt.Errorf("closing: %w", err)
 	}
-	if err := os.Rename(tmp.Name(), f.path); err != nil {
-		return fmt.Errorf("replacing key file: %w", err)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("replacing file: %w", err)
 	}
 	return nil
 }

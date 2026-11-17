@@ -8,8 +8,10 @@ developer-program approval), and an **MCP server** that lets AI agents read it.
 - `cmd/garmin-mcp` is the MCP server. It is the only place that uses a third-party
   module (the official MCP Go SDK).
 
-The Personal API is for one person's own data. Garmin's terms do not allow it in
-commercial multi-user applications.
+The Personal API is for people's own data. Garmin's FAQ says it is "not intended for
+commercial applications serving multiple end users". By default this server serves one
+person; [multi-user mode](#multiple-users) lets several people each use their own key.
+Read Garmin's terms before using it for anyone but yourself.
 
 ## Get an API key
 
@@ -57,6 +59,9 @@ with mode `0600` in a `0700` directory); `DELETE /auth` removes it.
 | `-allowed-host` / `GARMIN_MCP_ALLOWED_HOSTS` | Public hostname(s), comma separated, that the server may be reached as. Set it behind a reverse proxy; other `Host` values are refused. |
 | `-disable-auth-endpoint` / `GARMIN_MCP_DISABLE_AUTH_ENDPOINT` | Serve no `/auth` or key page (both answer 404), so a leaked token can never replace the key. The key must then come from `GARMIN_PERSONAL_API_KEY[_FILE]` or an existing `-key-store`; the server refuses to start without one. Use it whenever the server is reachable from outside. |
 | `-audit-log` / `GARMIN_MCP_AUDIT_LOG` | Append the audit trail (see below) to this file as JSON lines, mode `0600`. Without it the records appear in the normal log, tagged `audit=true`. |
+| `-users-file` / `GARMIN_MCP_USERS_FILE` | Run in [multi-user mode](#multiple-users), keeping the registered users in this file. Needs an admin token and a master key; replaces `-token`, `-key-store` and `/auth`. |
+| `-admin-token` / `GARMIN_MCP_ADMIN_TOKEN[_FILE]` | Multi-user mode: the token (at least 16 characters) that protects `/admin/users`. |
+| `GARMIN_MCP_MASTER_KEY[_FILE]` | Multi-user mode: 32 random bytes as 64 hex characters or base64 (`openssl rand -hex 32`). Encrypts every stored Garmin key. |
 | `-key-store` / `GARMIN_MCP_KEY_STORE` | Persist the key in this file. |
 | `GARMIN_PERSONAL_API_KEY` | Key to use at startup (wins over the key store). |
 | `GARMIN_MCP_TOKEN_FILE`, `GARMIN_PERSONAL_API_KEY_FILE` | Read the token / key from a file instead (Docker secrets); setting both forms of one is an error. |
@@ -67,7 +72,7 @@ with mode `0600` in a `0700` directory); `DELETE /auth` removes it.
 ### Security model
 
 This server exposes your health data and accepts your Garmin key, so by default it is
-built for a single user on one machine:
+built, by default, for a single user on one machine:
 
 - It binds to **loopback** and rejects requests whose `Host` header is not
   `localhost`, `127.0.0.1` or `::1` (DNS-rebinding defence).
@@ -85,6 +90,62 @@ built for a single user on one machine:
   Compose with Caddy and automatic HTTPS, exposing only `/mcp`) for reaching it from your
   phone.
 
+### Multiple users
+
+With `-users-file`, one server serves several people. Each is registered by you, the
+administrator, with their own Garmin key, and receives their own token. A token opens only
+that person's data.
+
+```sh
+export GARMIN_MCP_ADMIN_TOKEN=$(openssl rand -hex 24)   # protects /admin/users
+export GARMIN_MCP_MASTER_KEY=$(openssl rand -hex 32)    # encrypts the stored Garmin keys; keep it safe
+garmin-mcp -users-file ~/.config/garmin-mcp/users.json
+```
+
+Register someone (their Garmin key is checked with Garmin first; the response contains
+their token **once**):
+
+```sh
+printf '{"name":"alice","api_key":"%s"}' "$ALICE_GARMIN_KEY" | curl -H "Authorization: Bearer $GARMIN_MCP_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/admin/users
+```
+
+Alice then connects her MCP client to `/mcp` with `Authorization: Bearer <her token>`.
+
+| Request (admin token) | Effect |
+|---|---|
+| `POST /admin/users` `{"name","api_key"}` | Register a user. `201` with `id` and `token`; `422` if Garmin rejects the key; `409` if the name is taken. |
+| `GET /admin/users` | List users (`id`, `name`, `created_at`). Never keys or tokens. |
+| `DELETE /admin/users/{id}` | Remove a user. Their token stops working immediately, existing sessions included. |
+| `POST /admin/users/{id}/token` | Issue a new token; the old one stops working. Returned once. |
+| `PUT /admin/users/{id}/key` `{"api_key"}` | Replace the Garmin key (they expire after 30 days to a year). Checked with Garmin first. |
+
+How it is kept safe:
+
+- **Two kinds of token, never interchangeable.** The admin token opens only `/admin`, a user
+  token opens only `/mcp`. Neither opens `/auth`, which does not exist in this mode.
+- **Isolation.** Every user gets their own Garmin client and their own MCP sessions, so one
+  user's session id means nothing to another user, even one with a valid token. This is
+  tested by sabotaging the design and checking the tests fail.
+- **At rest.** A user's token is stored only as a SHA-256 hash. Their Garmin key is
+  encrypted with AES-256-GCM under the master key, bound to their user id so it cannot be
+  moved to another record. A copy of the users file is useless without the master key, and
+  the server refuses to start with the wrong one. Both the file and its directory are
+  private (`0600`, `0700`). Someone with root on the server can still read the master key
+  from its environment, so this protects backups and stray copies, not a compromised host.
+- **The administrator is trusted.** Registering someone means handing the server their
+  Garmin key; the server can read their data. Only register people who agree to that.
+- **Audit.** Every `tool_call` and every registration, removal, token rotation and key
+  change is recorded with the user's name and id (see the audit log below).
+- **Not combinable** with `-token`, `-key-store`, `-disable-auth-endpoint` or
+  `GARMIN_PERSONAL_API_KEY`: the server refuses to start, with the reason, rather than
+  guess which mode you meant.
+
+Garmin's terms are your responsibility. Its FAQ describes the Personal API as for people
+accessing their own data and not for commercial applications serving multiple end users;
+a household or friends each using their own key is the closest fit, a service for
+customers is not.
+
 ### Audit log
 
 The server records who asked for what, and who was turned away, so you can tell what was
@@ -92,10 +153,11 @@ read if a token ever leaks.
 
 | Event | When | Main fields |
 |---|---|---|
-| `tool_call` | A tool was called | `tool`, `args`, `outcome` (`ok` or `error`), `error`, `duration_ms`, `result_bytes`, `client`, `session` |
+| `tool_call` | A tool was called | `tool`, `args`, `outcome` (`ok` or `error`), `error`, `duration_ms`, `result_bytes`, `client`, `session`, and in multi-user mode `user` and `user_id` |
 | `client_connected` | A client finished the MCP handshake over HTTP | `client`, `session` |
 | `access_denied` | A request was refused | `reason` (`missing_token`, `invalid_token`, `forbidden_host`, `cross_origin`), `method`, `path`, `remote`, `forwarded_for`, `user_agent`, plus the `host` or `origin` that was rejected |
 | `key_set`, `key_rejected`, `key_set_failed`, `key_cleared` | The Garmin key was provided, refused, failed to validate, or removed at `/auth` | `remote`, `forwarded_for` |
+| `user_registered`, `user_removed`, `user_token_rotated`, `user_key_updated`, `user_key_rejected` | Multi-user mode: an administrator changed a user | `user`, `user_id`, `remote`, `forwarded_for` |
 
 Records go into the normal log tagged `audit=true`, or, with `-audit-log path`, into a
 separate append-only file of JSON lines (mode `0600`). Useful filters:

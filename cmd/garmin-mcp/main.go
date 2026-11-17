@@ -50,6 +50,9 @@ type config struct {
 	allowedHosts []string
 	keyStore     string
 	auditLog     string
+	usersFile    string // multi-user mode: where registered users are kept
+	adminToken   string // multi-user mode: protects /admin
+	masterKey    string // multi-user mode: encrypts stored Garmin keys
 	garminURL    string
 	logLevel     string
 	envKey       string // initial API key from GARMIN_PERSONAL_API_KEY[_FILE]
@@ -73,6 +76,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	case cfg.healthcheck:
 		return probeHealth(ctx, cfg.addr)
 	}
+	if err := cfg.validate(); err != nil {
+		return err
+	}
 
 	log, err := newLogger(cfg.logLevel, stderr)
 	if err != nil {
@@ -83,6 +89,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		return err
 	}
 	defer closeAudit()
+	if cfg.usersFile != "" {
+		return runMulti(ctx, cfg, log, audit, ready)
+	}
 	creds, srv, err := newServer(cfg, log, audit)
 	if err != nil {
 		return err
@@ -125,10 +134,18 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	if err != nil {
 		return config{}, err
 	}
+	adminDefault, err := secret(getenv, "GARMIN_MCP_ADMIN_TOKEN")
+	if err != nil {
+		return config{}, err
+	}
+	masterKey, err := secret(getenv, "GARMIN_MCP_MASTER_KEY")
+	if err != nil {
+		return config{}, err
+	}
 
 	fs := flag.NewFlagSet("garmin-mcp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cfg := config{envKey: envKey}
+	cfg := config{envKey: envKey, masterKey: masterKey}
 	var allowedHosts string
 	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8808", "address to listen on; a non-loopback address requires -token")
 	fs.StringVar(&cfg.token, "token", tokenDefault, "require this bearer token on /mcp and /auth (env GARMIN_MCP_TOKEN or GARMIN_MCP_TOKEN_FILE)")
@@ -137,11 +154,13 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.BoolVar(&cfg.healthcheck, "healthcheck", false, "probe a running server at -addr and exit 0 if it is healthy (for container health checks)")
 	fs.StringVar(&cfg.keyStore, "key-store", getenv("GARMIN_MCP_KEY_STORE"), "file in which to keep the API key between restarts, mode 0600 (env GARMIN_MCP_KEY_STORE); the key stays in memory only when unset")
 	fs.StringVar(&cfg.auditLog, "audit-log", getenv("GARMIN_MCP_AUDIT_LOG"), "append the audit trail (tool calls, refused requests, key changes) to this file as JSON lines, mode 0600; without it the records appear in the normal log tagged audit=true (env GARMIN_MCP_AUDIT_LOG)")
+	fs.StringVar(&cfg.usersFile, "users-file", getenv("GARMIN_MCP_USERS_FILE"), "run in multi-user mode, keeping the registered users in this file (mode 0600); needs -admin-token and GARMIN_MCP_MASTER_KEY, and replaces -token, -key-store and /auth (env GARMIN_MCP_USERS_FILE)")
+	fs.StringVar(&cfg.adminToken, "admin-token", adminDefault, "multi-user mode: bearer token, at least 16 characters, that protects /admin/users, where users are registered (env GARMIN_MCP_ADMIN_TOKEN or GARMIN_MCP_ADMIN_TOKEN_FILE)")
 	fs.StringVar(&cfg.garminURL, "garmin-url", getenv("GARMIN_PERSONAL_API_BASE_URL"), "Garmin API base URL; for testing")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth\n(unless -disable-auth-endpoint is set).\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth\n(unless -disable-auth-endpoint is set).\n\nWith -users-file the server serves several people instead: each is registered\nthrough /admin/users with their own Garmin key and receives their own token.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -149,6 +168,82 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	}
 	cfg.allowedHosts = splitList(allowedHosts)
 	return cfg, nil
+}
+
+// validate rejects flag combinations that would silently do the wrong thing.
+func (c config) validate() error {
+	if c.usersFile == "" {
+		switch {
+		case c.adminToken != "":
+			return errors.New("-admin-token only applies in multi-user mode (-users-file)")
+		case c.masterKey != "":
+			return errors.New("GARMIN_MCP_MASTER_KEY only applies in multi-user mode (-users-file)")
+		}
+		return nil
+	}
+	var clash []string
+	if c.token != "" {
+		clash = append(clash, "-token (use -admin-token and each user's own token)")
+	}
+	if c.keyStore != "" {
+		clash = append(clash, "-key-store")
+	}
+	if c.disableAuth {
+		clash = append(clash, "-disable-auth-endpoint")
+	}
+	if c.envKey != "" {
+		clash = append(clash, "GARMIN_PERSONAL_API_KEY")
+	}
+	if len(clash) > 0 {
+		return fmt.Errorf("-users-file (multi-user mode) cannot be combined with %s: in this mode every user's Garmin key is registered through /admin/users", strings.Join(clash, ", "))
+	}
+	if c.adminToken == "" {
+		return errors.New("multi-user mode needs an admin token: set -admin-token, GARMIN_MCP_ADMIN_TOKEN or GARMIN_MCP_ADMIN_TOKEN_FILE")
+	}
+	return nil
+}
+
+// runMulti serves many users, each with their own Garmin key and token.
+func runMulti(ctx context.Context, cfg config, log, audit *slog.Logger, ready func(addr string)) error {
+	key, err := mcpserver.ParseMasterKey(cfg.masterKey)
+	if err != nil {
+		return fmt.Errorf("GARMIN_MCP_MASTER_KEY (or GARMIN_MCP_MASTER_KEY_FILE): %w", err)
+	}
+	store, err := mcpserver.OpenUserStore(cfg.usersFile, key)
+	if err != nil {
+		return err
+	}
+	srv, err := mcpserver.NewMulti(mcpserver.MultiConfig{
+		Users:        store,
+		AdminToken:   cfg.adminToken,
+		AuthBaseURL:  cfg.garminURL,
+		Addr:         cfg.addr,
+		AllowedHosts: cfg.allowedHosts,
+		Logger:       log,
+		Audit:        audit,
+		Version:      version,
+		NewClient: func(ts garmin.TokenSource) *garmin.Client {
+			opts := []garmin.Option{garmin.WithTokenSource(ts), garmin.WithUserAgent("garmin-mcp/" + version)}
+			if cfg.garminURL != "" {
+				opts = append(opts, garmin.WithBaseURL(cfg.garminURL))
+			}
+			return garmin.New(opts...)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", cfg.addr)
+	if err != nil {
+		return err
+	}
+	bound := ln.Addr().String()
+	log.Info("listening", "addr", bound, "mode", "multi-user", "users", srv.UserCount(), "mcp", "/mcp", "admin", "/admin/users",
+		"audit_log", cmp.Or(cfg.auditLog, "(in this log, audit=true)"))
+	if ready != nil {
+		ready(bound)
+	}
+	return serve(ctx, ln, srv.Handler())
 }
 
 // newLogger builds the text logger for the given level name.
