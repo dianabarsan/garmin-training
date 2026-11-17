@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"html/template"
+	"io"
 	"log/slog"
 	"mime"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dianabarsan/garmin-training/garmin-connect/auth"
 )
@@ -17,6 +19,10 @@ import (
 // maxAuthBody bounds the /auth request body; an API key is a couple of hundred
 // bytes.
 const maxAuthBody = 4 << 10
+
+// authBodyTimeout bounds reading the /auth request body, so a client that
+// sends it slowly cannot hold a connection open indefinitely.
+const authBodyTimeout = 10 * time.Second
 
 // securityHeaders are set on every response from the auth endpoints.
 func securityHeaders(h http.Header) {
@@ -26,20 +32,32 @@ func securityHeaders(h http.Header) {
 	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
 }
 
+// bearerToken extracts the credentials of an "Authorization: Bearer <token>"
+// header. The scheme is case-insensitive (RFC 7235) and surrounding spaces are
+// ignored.
+func bearerToken(h string) (string, bool) {
+	scheme, cred, ok := strings.Cut(strings.TrimSpace(h), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	cred = strings.TrimSpace(cred)
+	return cred, cred != ""
+}
+
 // requireToken demands "Authorization: Bearer <token>" when token is set.
-func requireToken(token string, audit *slog.Logger, next http.Handler) http.Handler {
+func requireToken(token string, denied *denyAuditor, next http.Handler) http.Handler {
 	if token == "" {
 		return next
 	}
 	want := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		got, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
 			reason := "invalid_token"
 			if r.Header.Get("Authorization") == "" {
 				reason = "missing_token"
 			}
-			auditDenied(audit, r, reason) // never records what was presented
+			denied.record(r, reason) // never records what was presented
 			w.Header().Set("WWW-Authenticate", `Bearer realm="garmin-mcp"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -52,7 +70,7 @@ func requireToken(token string, audit *slog.Logger, next http.Handler) http.Hand
 // loopback-bound server against DNS rebinding, where a hostile web page makes
 // the browser send requests to localhost under an attacker-controlled name.
 // A nil or empty allowed set disables the check. /healthz is never refused.
-func hostGuard(allowed []string, audit *slog.Logger, next http.Handler) http.Handler {
+func hostGuard(allowed []string, denied *denyAuditor, next http.Handler) http.Handler {
 	if len(allowed) == 0 {
 		return next
 	}
@@ -74,7 +92,7 @@ func hostGuard(allowed []string, audit *slog.Logger, next http.Handler) http.Han
 			host = h
 		}
 		if !set[strings.ToLower(strings.Trim(host, "[]"))] {
-			auditDenied(audit, r, "forbidden_host", slog.String("host", truncate(r.Host, maxAuditField)))
+			denied.record(r, "forbidden_host", slog.String("host", truncate(r.Host, maxAuditField)))
 			http.Error(w, "forbidden host", http.StatusForbidden)
 			return
 		}
@@ -131,8 +149,15 @@ func authHandler(creds *Credentials, log, audit *slog.Logger) http.Handler {
 }
 
 func setKey(w http.ResponseWriter, r *http.Request, creds *Credentials, log, audit *slog.Logger) {
+	// Not supported by every ResponseWriter (test recorders); then the server's
+	// own timeouts are all there is.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(authBodyTimeout))
 	r.Body = http.MaxBytesReader(w, r.Body, maxAuthBody)
 	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	tooLarge := func(err error) bool {
+		var mbe *http.MaxBytesError
+		return errors.As(err, &mbe)
+	}
 
 	var key string
 	form := false
@@ -141,7 +166,22 @@ func setKey(w http.ResponseWriter, r *http.Request, creds *Credentials, log, aud
 		var in struct {
 			APIKey string `json:"api_key"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		dec := json.NewDecoder(r.Body)
+		err := dec.Decode(&in)
+		if err == nil {
+			// Exactly one JSON value: anything after it is a malformed request.
+			switch extra := dec.Decode(&struct{}{}); {
+			case extra == nil:
+				err = errors.New("trailing data after the JSON object")
+			case !errors.Is(extra, io.EOF):
+				err = extra // malformed, or too large
+			}
+		}
+		switch {
+		case tooLarge(err):
+			respondAuth(w, creds, false, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		case err != nil:
 			respondAuth(w, creds, false, http.StatusBadRequest, `body must be JSON like {"api_key": "..."}`)
 			return
 		}
@@ -149,6 +189,10 @@ func setKey(w http.ResponseWriter, r *http.Request, creds *Credentials, log, aud
 	case "application/x-www-form-urlencoded":
 		form = true
 		if err := r.ParseForm(); err != nil {
+			if tooLarge(err) {
+				respondAuth(w, creds, true, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
 			respondAuth(w, creds, true, http.StatusBadRequest, "could not read the form")
 			return
 		}

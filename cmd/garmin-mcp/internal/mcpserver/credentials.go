@@ -18,6 +18,10 @@ import (
 // been provided.
 var ErrNotAuthenticated = errors.New("not authenticated: no Garmin Personal API key has been provided")
 
+// ErrKeyNotSaved is returned (wrapped) by Set when Garmin accepted the key but
+// the key store could not save it. The key is not activated in that case.
+var ErrKeyNotSaved = errors.New("the key could not be saved")
+
 // KeyStore persists the API key across restarts. It is optional.
 type KeyStore interface {
 	// Load returns the stored key; ok is false when none is stored.
@@ -45,8 +49,16 @@ type Credentials struct {
 	httpClient *http.Client
 	store      KeyStore
 
-	mu sync.RWMutex
+	// writeMu serialises the operations that change the key (Set, UseUnverified,
+	// LoadStored, Clear), so the key store and the active key always agree.
+	writeMu sync.Mutex
+
+	mu sync.RWMutex // guards the fields below
 	ts *auth.TokenSource
+	// persisted caches whether the store holds a key, so Status needs no file
+	// I/O. It is read from the store once, on first use, then kept up to date.
+	persisted      bool
+	persistedKnown bool
 }
 
 // CredentialsOption configures NewCredentials.
@@ -92,19 +104,40 @@ func (c *Credentials) Set(ctx context.Context, key string) error {
 	if key == "" {
 		return auth.ErrNoAPIKey
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	ts := c.newSource(key)
 	if _, err := ts.AccessToken(ctx); err != nil {
 		return err
 	}
 	if c.store != nil {
 		if err := c.store.Save(key); err != nil {
-			return fmt.Errorf("saving key: %w", err)
+			return fmt.Errorf("%w: %w", ErrKeyNotSaved, err)
 		}
 	}
 	c.mu.Lock()
 	c.ts = ts
+	if c.store != nil {
+		c.persisted, c.persistedKnown = true, true
+	}
 	c.mu.Unlock()
 	return nil
+}
+
+// UseUnverified activates key without contacting Garmin and without saving it.
+// It is for a key from the server's own configuration that could not be
+// checked at startup (for example while the network is down): the key is
+// checked on the first request instead, and a rejection is reported then.
+func (c *Credentials) UseUnverified(key string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	c.ts = c.newSource(key)
+	c.mu.Unlock()
 }
 
 // LoadStored activates the key from the store without contacting Garmin, so a
@@ -113,41 +146,68 @@ func (c *Credentials) LoadStored() (bool, error) {
 	if c.store == nil {
 		return false, nil
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	key, ok, err := c.store.Load()
-	if err != nil || !ok || strings.TrimSpace(key) == "" {
+	if err != nil {
 		return false, err
 	}
+	ok = ok && strings.TrimSpace(key) != ""
 	c.mu.Lock()
-	c.ts = c.newSource(key)
+	c.persisted, c.persistedKnown = ok, true
+	if ok {
+		c.ts = c.newSource(key)
+	}
 	c.mu.Unlock()
-	return true, nil
+	return ok, nil
 }
 
-// Clear forgets the key, and deletes it from the store when there is one.
+// Clear forgets the key, and deletes it from the store when there is one. The
+// key is forgotten in memory even if deleting the stored copy fails; the error
+// then says so, and Status still reports it as persisted.
 func (c *Credentials) Clear() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.mu.Lock()
 	c.ts = nil
 	c.mu.Unlock()
-	if c.store != nil {
-		return c.store.Delete()
+	if c.store == nil {
+		return nil
 	}
+	if err := c.store.Delete(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.persisted, c.persistedKnown = false, true
+	c.mu.Unlock()
 	return nil
 }
 
 // Status reports the credential state.
 func (c *Credentials) Status() Status {
 	c.mu.RLock()
-	ts := c.ts
+	ts, persisted, known := c.ts, c.persisted, c.persistedKnown
 	c.mu.RUnlock()
-	if ts == nil {
-		return Status{Persisted: c.store != nil && c.hasStored()}
+	if c.store != nil && !known {
+		persisted = c.loadPersisted()
 	}
-	return Status{Authenticated: true, TokenExpiresAt: ts.ExpiresAt(), Persisted: c.store != nil && c.hasStored()}
+	if ts == nil {
+		return Status{Persisted: persisted}
+	}
+	return Status{Authenticated: true, TokenExpiresAt: ts.ExpiresAt(), Persisted: persisted}
 }
 
-func (c *Credentials) hasStored() bool {
-	_, ok, err := c.store.Load()
-	return err == nil && ok
+// loadPersisted reads, once, whether the store holds a key. It does not take
+// writeMu, so it never waits for a Set that is talking to Garmin; holding mu is
+// enough, because writers update the flag under mu after changing the store.
+func (c *Credentials) loadPersisted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.persistedKnown {
+		_, ok, err := c.store.Load()
+		c.persisted, c.persistedKnown = err == nil && ok, err == nil
+	}
+	return c.persisted
 }
 
 // AccessToken implements garminconnect.TokenSource.

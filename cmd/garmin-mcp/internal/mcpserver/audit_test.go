@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -326,5 +327,70 @@ func TestAudit_NoArgumentsMeansNoArgsField(t *testing.T) {
 	}
 	if _, present := calls[0]["args"]; present {
 		t.Errorf("empty arguments should not be logged as %q", calls[0]["args"])
+	}
+}
+
+// deniedRequest is a refused request from addr, for driving a denyAuditor.
+func deniedRequest(addr string) *http.Request {
+	r, _ := http.NewRequest("GET", "http://127.0.0.1/mcp", nil)
+	r.RemoteAddr = addr
+	return r
+}
+
+func TestDenyAuditor_ThrottlesEachSource(t *testing.T) {
+	t.Parallel()
+	var ac auditCapture
+	now := fixedNow
+	d := newDenyAuditor(ac.logger(), func() time.Time { return now })
+
+	for range deniedBurst + 5 {
+		d.record(deniedRequest("203.0.113.1:1000"), "invalid_token")
+	}
+	// Another address has its own budget.
+	d.record(deniedRequest("203.0.113.2:1000"), "invalid_token")
+
+	if n := len(ac.events(t, "access_denied")); n != deniedBurst+1 {
+		t.Errorf("access_denied records = %d, want %d (the burst plus the other address)", n, deniedBurst+1)
+	}
+	thr := ac.events(t, "access_denied_throttled")
+	if len(thr) != 1 || str(thr[0], "remote") != "203.0.113.1:1000" || str(thr[0], "resumes_at") == "" {
+		t.Fatalf("throttled records = %+v", thr)
+	}
+
+	// After the window, recording resumes and reports what was left out.
+	now = now.Add(deniedWindow)
+	d.record(deniedRequest("203.0.113.1:2000"), "invalid_token")
+	all := ac.events(t, "access_denied")
+	last := all[len(all)-1]
+	if got, _ := last["previously_unrecorded"].(float64); got != 5 {
+		t.Errorf("previously_unrecorded = %v, want 5 (%+v)", last["previously_unrecorded"], last)
+	}
+}
+
+func TestDenyAuditor_TracksABoundedNumberOfSources(t *testing.T) {
+	t.Parallel()
+	var ac auditCapture
+	d := newDenyAuditor(ac.logger(), func() time.Time { return fixedNow })
+	for i := range deniedMaxSources + 50 {
+		d.record(deniedRequest(fmt.Sprintf("10.%d.%d.%d:1", i>>16&255, i>>8&255, i&255)), "invalid_token")
+	}
+	if n := len(d.sources); n > deniedMaxSources+1 {
+		t.Errorf("tracked sources = %d, want at most %d", n, deniedMaxSources+1)
+	}
+}
+
+func TestAudit_RefusalFloodIsThrottledEndToEnd(t *testing.T) {
+	t.Parallel()
+	var ac auditCapture
+	h := newHarness(t, func(c *Config) { c.Audit = ac.logger(); c.Token = "tok-real-0123456789" })
+	base := serveHandler(t, h)
+	for range deniedBurst * 2 {
+		do(t, "POST", base+"/mcp", "application/json", `{}`, nil)
+	}
+	if n := len(ac.events(t, "access_denied")); n != deniedBurst {
+		t.Errorf("access_denied records = %d, want %d", n, deniedBurst)
+	}
+	if n := len(ac.events(t, "access_denied_throttled")); n != 1 {
+		t.Errorf("access_denied_throttled records = %d, want 1", n)
 	}
 }

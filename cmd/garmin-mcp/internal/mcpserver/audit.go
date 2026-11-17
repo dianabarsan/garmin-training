@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -91,9 +93,104 @@ func remoteAttrs(r *http.Request) []slog.Attr {
 	return attrs
 }
 
-// auditDenied records a refused request.
-func auditDenied(l *slog.Logger, r *http.Request, reason string, extra ...slog.Attr) {
-	l.LogAttrs(r.Context(), slog.LevelWarn, "access_denied", deniedAttrs(r, reason, extra...)...)
+// Refused requests are recorded at most deniedBurst times per remote address
+// in each deniedWindow, so anyone who can reach the port cannot flood the audit
+// log (and the disk) with refusals or bury the tool calls among them.
+const (
+	deniedBurst      = 20
+	deniedWindow     = time.Minute
+	deniedMaxSources = 1024 // addresses tracked at once; the rest share one budget
+)
+
+// denyAuditor records refused requests, throttled per remote address. When an
+// address exceeds its budget, one access_denied_throttled record says so; the
+// number of refusals left out is reported in the next record for that address
+// after the window ends.
+type denyAuditor struct {
+	log *slog.Logger
+	now func() time.Time
+
+	mu      sync.Mutex
+	sources map[string]*denySource
+}
+
+type denySource struct {
+	start      time.Time
+	count      int // refusals recorded in this window
+	suppressed int // refusals left out in this window
+}
+
+func newDenyAuditor(log *slog.Logger, now func() time.Time) *denyAuditor {
+	return &denyAuditor{log: log, now: now, sources: map[string]*denySource{}}
+}
+
+// record logs a refused request, unless its source has used up its budget.
+func (d *denyAuditor) record(r *http.Request, reason string, extra ...slog.Attr) {
+	src := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(src); err == nil {
+		src = h
+	}
+	now := d.now()
+
+	d.mu.Lock()
+	s := d.source(src, now)
+	var missed int
+	if now.Sub(s.start) >= deniedWindow {
+		missed = s.suppressed
+		*s = denySource{start: now}
+	}
+	s.count++
+	verdict := "log"
+	switch {
+	case s.count == deniedBurst+1:
+		verdict = "throttle"
+		s.suppressed++
+	case s.count > deniedBurst+1:
+		verdict = "drop"
+		s.suppressed++
+	}
+	until := s.start.Add(deniedWindow)
+	d.mu.Unlock()
+
+	ctx := r.Context()
+	switch verdict {
+	case "log":
+		attrs := deniedAttrs(r, reason, extra...)
+		if missed > 0 {
+			attrs = append(attrs, slog.Int("previously_unrecorded", missed))
+		}
+		d.log.LogAttrs(ctx, slog.LevelWarn, "access_denied", attrs...)
+	case "throttle":
+		attrs := append(remoteAttrs(r),
+			slog.Int("recorded", deniedBurst),
+			slog.Time("resumes_at", until.UTC()))
+		d.log.LogAttrs(ctx, slog.LevelWarn, "access_denied_throttled", attrs...)
+	}
+}
+
+// source returns the counters for src, creating them. The map is bounded:
+// expired entries are dropped when it is full, and if it is still full, new
+// sources share one entry.
+func (d *denyAuditor) source(src string, now time.Time) *denySource {
+	if s, ok := d.sources[src]; ok {
+		return s
+	}
+	if len(d.sources) >= deniedMaxSources {
+		for k, s := range d.sources {
+			if now.Sub(s.start) >= deniedWindow && s.suppressed == 0 {
+				delete(d.sources, k)
+			}
+		}
+		if len(d.sources) >= deniedMaxSources {
+			src = "(other)"
+			if s, ok := d.sources[src]; ok {
+				return s
+			}
+		}
+	}
+	s := &denySource{start: now}
+	d.sources[src] = s
+	return s
 }
 
 // auditMiddleware records every tool call, for all tools at once, without each

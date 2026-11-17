@@ -23,11 +23,11 @@ func writeSecret(t *testing.T, content string) string {
 
 func TestRun_TokenFromEnvironmentProtectsEndpoints(t *testing.T) {
 	garminSrv, _ := fakeGarmin(t)
-	base, _, _ := start(t, map[string]string{"GARMIN_MCP_TOKEN": "env-token"}, "-garmin-url", garminSrv.URL)
+	base, _, _ := start(t, map[string]string{"GARMIN_MCP_TOKEN": "env-token-0123456789"}, "-garmin-url", garminSrv.URL)
 	if code, _ := get(t, base+"/auth", nil); code != 401 {
 		t.Errorf("without token: %d", code)
 	}
-	if code, _ := get(t, base+"/auth", map[string]string{"Authorization": "Bearer env-token"}); code != 200 {
+	if code, _ := get(t, base+"/auth", map[string]string{"Authorization": "Bearer env-token-0123456789"}); code != 200 {
 		t.Errorf("with token: %d", code)
 	}
 }
@@ -43,7 +43,7 @@ func TestRun_RefusesToExposeItselfWithoutAToken(t *testing.T) {
 	ready := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, []string{"-addr", "0.0.0.0:0", "-token", "t"}, func(string) string { return "" }, &logs, func(a string) { ready <- a })
+		done <- run(ctx, []string{"-addr", "0.0.0.0:0", "-token", "flag-token-0123456789"}, func(string) string { return "" }, &logs, func(a string) { ready <- a })
 	}()
 	select {
 	case <-ready:
@@ -85,14 +85,14 @@ func TestRun_FlagsAndVersion(t *testing.T) {
 func TestRun_SecretsFromFiles(t *testing.T) {
 	garminSrv, _ := fakeGarmin(t)
 	env := map[string]string{
-		"GARMIN_MCP_TOKEN_FILE":        writeSecret(t, "file-token\n"), // a trailing newline is normal in secret files
+		"GARMIN_MCP_TOKEN_FILE":        writeSecret(t, "file-token-0123456789\n"), // a trailing newline is normal in secret files
 		"GARMIN_PERSONAL_API_KEY_FILE": writeSecret(t, goodKey+"\n"),
 	}
 	base, logs, _ := start(t, env, "-garmin-url", garminSrv.URL)
 	if code, _ := get(t, base+"/auth", nil); code != 401 {
 		t.Errorf("the token from a file must be enforced: %d", code)
 	}
-	code, body := get(t, base+"/auth", map[string]string{"Authorization": "Bearer file-token"})
+	code, body := get(t, base+"/auth", map[string]string{"Authorization": "Bearer file-token-0123456789"})
 	if code != 200 || !strings.Contains(body, `"authenticated":true`) {
 		t.Errorf("token and key from files: %d %s\n%s", code, body, logs.String())
 	}
@@ -107,6 +107,10 @@ func TestRun_SecretSourceErrors(t *testing.T) {
 		"key set twice":      {"GARMIN_PERSONAL_API_KEY": "a", "GARMIN_PERSONAL_API_KEY_FILE": writeSecret(t, "b")},
 		"token file missing": {"GARMIN_MCP_TOKEN_FILE": filepath.Join(t.TempDir(), "absent")},
 		"key file missing":   {"GARMIN_PERSONAL_API_KEY_FILE": filepath.Join(t.TempDir(), "absent")},
+		// An empty secret file (a failed mount) must not mean "no token".
+		"token file empty": {"GARMIN_MCP_TOKEN_FILE": writeSecret(t, " \n")},
+		"key file empty":   {"GARMIN_PERSONAL_API_KEY_FILE": writeSecret(t, "")},
+		"token too short":  {"GARMIN_MCP_TOKEN": "short"},
 	} {
 		err := run(context.Background(), []string{"-addr", "127.0.0.1:0"}, func(k string) string { return env[k] }, io.Discard, nil)
 		if err == nil {
@@ -176,3 +180,43 @@ func TestRun_FlyAppNameAllowsItsHostname(t *testing.T) {
 		t.Error("a configured hostname and the Fly one should both be allowed")
 	}
 }
+
+func TestParseConfig_HelpNeverShowsTheToken(t *testing.T) {
+	const secretToken = "HELP-LEAK-CHECK-0123456789"
+	for name, env := range map[string]map[string]string{
+		"environment": {"GARMIN_MCP_TOKEN": secretToken},
+		"file":        {"GARMIN_MCP_TOKEN_FILE": writeSecret(t, secretToken)},
+	} {
+		// -h, and a mistyped flag, both print the usage text with the flag defaults.
+		for _, args := range [][]string{{"-h"}, {"-no-such-flag"}} {
+			var out strings.Builder
+			_, _ = parseConfig(args, func(k string) string { return env[k] }, &out)
+			if strings.Contains(out.String(), secretToken) {
+				t.Errorf("%s %v: the usage text shows the token:\n%s", name, args, out.String())
+			}
+			if !strings.Contains(out.String(), "-token") {
+				t.Errorf("%s %v: the usage text should still list -token:\n%s", name, args, out.String())
+			}
+		}
+	}
+}
+
+func TestParseConfig_TokenSources(t *testing.T) {
+	env := func(k string) string { return map[string]string{"GARMIN_MCP_TOKEN": "env-token-0123456789"}[k] }
+	cfg, err := parseConfig(nil, env, io.Discard)
+	if err != nil || cfg.token != "env-token-0123456789" {
+		t.Errorf("from the environment: token=%q err=%v", cfg.token, err)
+	}
+	cfg, err = parseConfig([]string{"-token", "flag-token-0123456789"}, env, io.Discard)
+	if err != nil || cfg.token != "flag-token-0123456789" {
+		t.Errorf("the flag should win: token=%q err=%v", cfg.token, err)
+	}
+	if _, err := parseConfig([]string{"-token", "short"}, noEnvFunc, io.Discard); err == nil {
+		t.Error("a short token on the command line must be refused")
+	}
+	if _, err := parseConfig([]string{"-audit-log-max-mb", "-1"}, noEnvFunc, io.Discard); err == nil {
+		t.Error("a negative audit size limit must be refused")
+	}
+}
+
+func noEnvFunc(string) string { return "" }

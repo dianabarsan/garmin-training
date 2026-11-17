@@ -74,7 +74,7 @@ func TestRun_ShutsDownCleanlyWithAConnectedClient(t *testing.T) {
 
 func TestRun_Healthcheck(t *testing.T) {
 	garminSrv, _ := fakeGarmin(t)
-	base, _, stop := start(t, map[string]string{"GARMIN_MCP_TOKEN": "tok"}, "-garmin-url", garminSrv.URL)
+	base, _, stop := start(t, map[string]string{"GARMIN_MCP_TOKEN": "tok-0123456789abcdef"}, "-garmin-url", garminSrv.URL)
 	hostPort := strings.TrimPrefix(base, "http://")
 	noEnv := func(string) string { return "" }
 

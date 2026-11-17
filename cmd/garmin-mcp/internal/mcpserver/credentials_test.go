@@ -186,3 +186,118 @@ func TestCredentials_ConcurrentUse(t *testing.T) {
 	}
 	wg.Wait() // the race detector is the assertion
 }
+
+// countingStore is an in-memory KeyStore that counts loads and can fail saves.
+type countingStore struct {
+	mu       sync.Mutex
+	key      string
+	loads    int
+	failSave bool
+}
+
+func (s *countingStore) Load() (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loads++
+	return s.key, s.key != "", nil
+}
+
+func (s *countingStore) Save(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failSave {
+		return errors.New("disk full")
+	}
+	s.key = key
+	return nil
+}
+
+func (s *countingStore) Delete() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.key = ""
+	return nil
+}
+
+func TestCredentials_StatusDoesNotReadTheStoreEveryTime(t *testing.T) {
+	t.Parallel()
+	st := &countingStore{key: validKey}
+	c := NewCredentials(WithAuthBaseURL(newFakeGarmin(t).srv.URL), WithKeyStore(st))
+	for range 5 {
+		if !c.Status().Persisted {
+			t.Fatal("Persisted should be true")
+		}
+	}
+	if st.loads != 1 {
+		t.Errorf("store loaded %d times, want 1", st.loads)
+	}
+	if err := c.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Status().Persisted {
+		t.Error("Persisted should be false after Clear")
+	}
+	if err := c.Set(context.Background(), validKey); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Status().Persisted || st.loads != 1 {
+		t.Errorf("after Set: persisted=%v loads=%d", c.Status().Persisted, st.loads)
+	}
+}
+
+func TestCredentials_KeyThatCannotBeSavedIsNotActivated(t *testing.T) {
+	t.Parallel()
+	c := NewCredentials(WithAuthBaseURL(newFakeGarmin(t).srv.URL), WithKeyStore(&countingStore{failSave: true}))
+	err := c.Set(context.Background(), validKey)
+	if !errors.Is(err, ErrKeyNotSaved) {
+		t.Fatalf("err = %v, want ErrKeyNotSaved", err)
+	}
+	if c.Status().Authenticated {
+		t.Error("a key that could not be saved must not be activated")
+	}
+}
+
+func TestCredentials_UseUnverifiedActivatesWithoutContactingGarmin(t *testing.T) {
+	t.Parallel()
+	fg := newFakeGarmin(t)
+	st := &countingStore{}
+	c := NewCredentials(WithAuthBaseURL(fg.srv.URL), WithKeyStore(st))
+	c.UseUnverified(validKey)
+	if !c.Status().Authenticated || fg.exchangeCount() != 0 {
+		t.Fatalf("authenticated=%v exchanges=%d", c.Status().Authenticated, fg.exchangeCount())
+	}
+	if st.key != "" {
+		t.Error("an unverified key must not be saved")
+	}
+	if _, err := c.AccessToken(context.Background()); err != nil {
+		t.Errorf("the key should be checked on first use and work: %v", err)
+	}
+}
+
+// Set and Clear running at the same time must leave the store and the active
+// key in agreement: both holding the key, or neither.
+func TestCredentials_ConcurrentSetAndClearStayConsistent(t *testing.T) {
+	t.Parallel()
+	st := &countingStore{}
+	c := NewCredentials(WithAuthBaseURL(newFakeGarmin(t).srv.URL), WithKeyStore(st))
+	for round := range 20 {
+		var wg sync.WaitGroup
+		for i := range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if i%2 == 0 {
+					_ = c.Set(context.Background(), validKey)
+				} else {
+					_ = c.Clear()
+				}
+			}()
+		}
+		wg.Wait()
+		active := c.Status().Authenticated
+		_, stored, _ := st.Load()
+		if active != stored {
+			t.Fatalf("round %d: active key = %v but stored key = %v", round, active, stored)
+		}
+	}
+}

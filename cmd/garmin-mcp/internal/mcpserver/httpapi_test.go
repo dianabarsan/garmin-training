@@ -105,7 +105,11 @@ func TestAuthEndpoint_Rejections(t *testing.T) {
 		{"malformed JSON", "application/json", `{"api_key":`, http.StatusBadRequest},
 		{"wrong content type", "text/plain", validKey, http.StatusUnsupportedMediaType},
 		{"no content type", "", `{"api_key":"x"}`, http.StatusUnsupportedMediaType},
-		{"oversized body", "application/json", `{"api_key":"` + strings.Repeat("a", 10000) + `"}`, http.StatusBadRequest},
+		{"oversized body", "application/json", `{"api_key":"` + strings.Repeat("a", 10000) + `"}`, http.StatusRequestEntityTooLarge},
+		{"oversized form", "application/x-www-form-urlencoded", "api_key=" + strings.Repeat("a", 10000), http.StatusRequestEntityTooLarge},
+		// A valid key followed by more data is still a malformed request.
+		{"second JSON value", "application/json", `{"api_key":"` + validKey + `"} {"api_key":"x"}`, http.StatusBadRequest},
+		{"trailing garbage", "application/json", `{"api_key":"` + validKey + `"}xyz`, http.StatusBadRequest},
 	}
 	for _, tc := range tests {
 		code, body, _ := do(t, "POST", base+"/auth", tc.ctype, tc.body, nil)
@@ -482,5 +486,41 @@ func TestHealthzIgnoresTheHostHeader(t *testing.T) {
 		if code, _, _ := do(t, "GET", base+"/auth", "", "", map[string]string{"Host": "evil.example"}); code != 403 && code != 404 {
 			t.Errorf("%s: another path let a foreign Host through: %d", name, code)
 		}
+	}
+}
+
+func TestBearerToken(t *testing.T) {
+	t.Parallel()
+	for h, want := range map[string]string{
+		"Bearer abc":    "abc",
+		"bearer abc":    "abc", // the scheme is case-insensitive (RFC 7235)
+		"BEARER abc":    "abc",
+		"Bearer   abc ": "abc",
+		" Bearer abc":   "abc",
+		"Bearer":        "",
+		"Bearer ":       "",
+		"Basic abc":     "",
+		"":              "",
+		"Bearerabc":     "",
+	} {
+		got, ok := bearerToken(h)
+		if got != want || ok != (want != "") {
+			t.Errorf("bearerToken(%q) = %q, %v; want %q", h, got, ok, want)
+		}
+	}
+}
+
+func TestRequireToken_AcceptsAnyCaseOfTheScheme(t *testing.T) {
+	t.Parallel()
+	const token = "tok-real-0123456789"
+	h := newHarness(t, func(c *Config) { c.Token = token })
+	base := serveHandler(t, h)
+	for _, hdr := range []string{"Bearer " + token, "bearer " + token, "Bearer  " + token} {
+		if code, _, _ := do(t, "GET", base+"/auth", "", "", map[string]string{"Authorization": hdr}); code != http.StatusOK {
+			t.Errorf("%q: status %d, want 200", hdr, code)
+		}
+	}
+	if code, _, _ := do(t, "GET", base+"/auth", "", "", map[string]string{"Authorization": "Bearer " + token + "x"}); code != http.StatusUnauthorized {
+		t.Errorf("a wrong token: status %d, want 401", code)
 	}
 }

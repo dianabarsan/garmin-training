@@ -131,7 +131,8 @@ in the conversation.
   `docker compose logs garmin-mcp | grep audit=true`. Behind Caddy the address logged as
   `remote` is Caddy's, so a client's real address is only a hint in `forwarded_for`. To keep
   a separate file, add `"-audit-log", "/data/audit.log"` to the service's `command` (the
-  `/data` volume is already writable); it is not rotated.
+  `/data` volume is already writable); it is rotated to `audit.log.1` at 10 MB
+  (`-audit-log-max-mb`).
 - **What the server refuses:** requests for any hostname other than yours, any request
   without the token, and (at Caddy) every path except `/mcp`.
 - **Garmin's terms:** the Personal API is for your own data only. Do not share this

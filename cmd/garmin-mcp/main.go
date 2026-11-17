@@ -21,12 +21,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/dianabarsan/garmin-training/cmd/garmin-mcp/internal/mcpserver"
 	garminconnect "github.com/dianabarsan/garmin-training/garmin-connect"
+	"github.com/dianabarsan/garmin-training/garmin-connect/auth"
 )
 
 // version is set at build time: -ldflags "-X main.version=v1.2.3".
@@ -61,7 +61,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	if err != nil {
 		return err
 	}
-	audit, closeAudit, err := newAuditLogger(cfg.auditLog, log)
+	audit, closeAudit, err := newAuditLogger(cfg.auditLog, cfg.auditMaxMB<<20, log)
 	if err != nil {
 		return err
 	}
@@ -103,6 +103,7 @@ func newServer(cfg config, log, audit *slog.Logger) (*mcpserver.Credentials, *mc
 		if err != nil {
 			return nil, nil, fmt.Errorf("-key-store: %w", err)
 		}
+		restrictFile(path, "the key store", log)
 		credOpts = append(credOpts, mcpserver.WithKeyStore(mcpserver.NewFileKeyStore(path)))
 	}
 	creds := mcpserver.NewCredentials(credOpts...)
@@ -132,20 +133,28 @@ func newServer(cfg config, log, audit *slog.Logger) (*mcpserver.Credentials, *mc
 // environment or a secret file) wins, otherwise the key store's. It reports
 // whether a key was supplied at all. A key Garmin rejects still counts as
 // supplied: it is reported but not fatal, because it can be replaced (at /auth
-// when that endpoint is enabled, otherwise by restarting with a new key).
+// when that endpoint is enabled, otherwise by restarting with a new key). A key
+// that could not be checked (Garmin unreachable, or the key store failing) is
+// used anyway and checked on the first request, so a network blip at startup
+// does not leave the server without its key.
 func loadInitialKey(ctx context.Context, creds *mcpserver.Credentials, envKey string, authEndpoint bool, log *slog.Logger) (supplied bool) {
 	if envKey != "" {
 		vctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
-		if err := creds.Set(vctx, envKey); err != nil {
+		err := creds.Set(vctx, envKey)
+		switch {
+		case err == nil:
+			log.Info("API key from the environment accepted")
+		case errors.Is(err, auth.ErrInvalidKey):
 			remedy := "provide a key at /auth"
 			if !authEndpoint {
 				remedy = "restart with a new key"
 			}
 			log.Warn("the API key from GARMIN_PERSONAL_API_KEY was not accepted; "+remedy, "reason", reasonOf(err))
-			return true
+		default:
+			creds.UseUnverified(envKey)
+			log.Warn("could not check the API key from GARMIN_PERSONAL_API_KEY; using it anyway, it is checked again on the first request", "reason", reasonOf(err))
 		}
-		log.Info("API key from the environment accepted")
 		return true
 	}
 	ok, err := creds.LoadStored()
@@ -159,10 +168,22 @@ func loadInitialKey(ctx context.Context, creds *mcpserver.Credentials, envKey st
 	return ok
 }
 
-// reasonOf gives a log-safe reason for a rejected key.
+// reasonOf gives a log-safe reason for a failed key check. It maps known
+// errors to fixed text instead of quoting the error, which could carry
+// details such as file paths.
 func reasonOf(err error) string {
-	if err == nil {
+	switch {
+	case err == nil:
 		return ""
+	case errors.Is(err, auth.ErrInvalidKey):
+		return "rejected by Garmin"
+	case errors.Is(err, auth.ErrMalformedToken):
+		return "unexpected answer from Garmin"
+	case errors.Is(err, mcpserver.ErrKeyNotSaved):
+		return "could not save it to the key store"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "Garmin did not answer in time"
+	default:
+		return "could not reach Garmin"
 	}
-	return strings.SplitN(err.Error(), ":", 2)[0]
 }

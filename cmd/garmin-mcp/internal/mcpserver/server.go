@@ -75,7 +75,8 @@ type Server struct {
 	log          *slog.Logger
 	now          func() time.Time
 	audit        *slog.Logger
-	authEndpoint bool // whether /auth and the key page are served
+	denied       *denyAuditor // refused requests, throttled
+	authEndpoint bool         // whether /auth and the key page are served
 
 	mcp     *mcp.Server
 	handler http.Handler
@@ -101,6 +102,7 @@ func New(cfg Config) (*Server, error) {
 	if s.audit == nil {
 		s.audit = s.log.With("audit", true)
 	}
+	s.denied = newDenyAuditor(s.audit, s.now)
 	version := cfg.Version
 	if version == "" {
 		version = "dev"
@@ -116,7 +118,7 @@ func New(cfg Config) (*Server, error) {
 
 	protect := http.NewCrossOriginProtection()
 	protect.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auditDenied(s.audit, r, "cross_origin",
+		s.denied.record(r, "cross_origin",
 			slog.String("origin", truncate(r.Header.Get("Origin"), maxAuditField)),
 			slog.String("sec_fetch_site", truncate(r.Header.Get("Sec-Fetch-Site"), maxAuditField)))
 		http.Error(w, "cross-origin request refused", http.StatusForbidden)
@@ -133,9 +135,9 @@ func New(cfg Config) (*Server, error) {
 		hosts = LoopbackHosts
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", requireToken(cfg.Token, s.audit, protect.Handler(mcpHandler)))
+	mux.Handle("/mcp", requireToken(cfg.Token, s.denied, protect.Handler(mcpHandler)))
 	if s.authEndpoint {
-		mux.Handle("/auth", requireToken(cfg.Token, s.audit, protect.Handler(authHandler(s.creds, s.log, s.audit))))
+		mux.Handle("/auth", requireToken(cfg.Token, s.denied, protect.Handler(authHandler(s.creds, s.log, s.audit))))
 		if cfg.Token == "" {
 			mux.Handle("/", protect.Handler(indexHandler(s.creds)))
 		}
@@ -144,7 +146,7 @@ func New(cfg Config) (*Server, error) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	s.handler = hostGuard(hosts, s.audit, mux)
+	s.handler = hostGuard(hosts, s.denied, mux)
 	return s, nil
 }
 

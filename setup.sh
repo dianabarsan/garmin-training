@@ -116,10 +116,13 @@ remove_connector() {
 
 if [ "$MODE" = audit-log ]; then
 	exists "$CONTAINER" || die "no '$CONTAINER' container; run ./setup.sh first"
-	# The image has no shell, so the file is read with `docker cp`, which streams a tar archive.
-	if ! docker cp "$CONTAINER:$AUDIT_FILE" - 2>/dev/null | tar -xO; then
-		echo "No audit records yet." >&2
-	fi
+	# The image has no shell, so the files are read with `docker cp`, which streams
+	# a tar archive. The server rotates the log to audit.log.1; that one is older.
+	found=0
+	for f in "$AUDIT_FILE.1" "$AUDIT_FILE"; do
+		if docker cp "$CONTAINER:$f" - 2>/dev/null | tar -xO 2>/dev/null; then found=1; fi
+	done
+	[ "$found" = 1 ] || echo "No audit records yet." >&2
 	exit 0
 fi
 

@@ -44,6 +44,12 @@ func (f *FileKeyStore) Save(key string) error {
 		tmp.Close()
 		return fmt.Errorf("writing key: %w", err)
 	}
+	// Flushed before the rename, so a crash cannot leave an empty key file in
+	// place of the old one.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing key: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("closing key file: %w", err)
 	}

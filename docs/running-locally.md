@@ -62,8 +62,9 @@ By default the key lives in memory only. To keep it, give the server a file:
 garmin-mcp -key-store ~/.config/garmin-mcp/key
 ```
 
-The file is created with mode `600` inside a `700` directory, and loaded at startup
-without contacting Garmin. `DELETE /auth` (see below) removes it.
+The file is written with mode `600` (a directory the server creates is `700`); an existing
+file that others can read is made private at startup. It is loaded at startup without
+contacting Garmin. `DELETE /auth` (see below) removes it.
 
 Another way is to pass the key at startup through the `GARMIN_PERSONAL_API_KEY`
 environment variable. That wins over the stored one. Do not put the key on the command
@@ -234,7 +235,9 @@ Things to know:
 | `401 unauthorized` | A token is required and missing or wrong. Send `Authorization: Bearer <token>`. |
 | `403 forbidden host` | You reached the server under a name it does not expect. Use `127.0.0.1` or `localhost`, or set `-allowed-host`. |
 | `address already in use` | Another program has the port. Use another one: `-addr 127.0.0.1:8809`. |
-| `refusing to listen ... without a token` | You bound a non-loopback address. Add `-token`, or use a loopback address. |
+| `refusing to listen ... without a token` | You bound a non-loopback address. Set a token (`GARMIN_MCP_TOKEN`), or use a loopback address. |
+| `the token must be at least 16 characters long` | Generate a longer one: `openssl rand -hex 32`. |
+| `..._FILE names an empty file` | The secret file is empty, for example because a secret mount failed. Fix the file; the server will not start without its token. |
 | `-disable-auth-endpoint needs a key from the start` | With the endpoint removed the key must come from `GARMIN_PERSONAL_API_KEY[_FILE]` or an existing `-key-store` file. Store it first (section 7). |
 | `404` on `/auth` or `/` | The server was started with `-disable-auth-endpoint`, by design. |
 | Claude Code says the server failed to connect | Check `curl -s http://127.0.0.1:8808/healthz` prints `ok`, and look at the server's log. |

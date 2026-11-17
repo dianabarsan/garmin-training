@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/dianabarsan/garmin-training/cmd/garmin-mcp/internal/mcpserver"
+	"github.com/dianabarsan/garmin-training/garmin-connect/auth"
 )
 
 func TestRun_KeyFromEnvironment(t *testing.T) {
@@ -182,5 +187,46 @@ func TestRun_RejectedKeyWithoutTheEndpointSaysToRestart(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "SECRET") {
 		t.Errorf("the rejected key leaked into the log:\n%s", logs.String())
+	}
+}
+
+// A key from the environment that cannot be checked because Garmin is
+// unreachable is used anyway, not discarded: otherwise a network blip at
+// startup would leave a server without /auth unusable until restarted.
+func TestRun_UnreachableGarminKeepsTheEnvironmentKey(t *testing.T) {
+	closed := httptest.NewServer(http.NotFoundHandler())
+	unreachable := closed.URL
+	closed.Close()
+
+	base, logs, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey}, "-garmin-url", unreachable)
+	if _, body := get(t, base+"/auth", nil); !strings.Contains(body, `"authenticated":true`) {
+		t.Errorf("the unchecked key should be in use: %s\n%s", body, logs.String())
+	}
+	if !strings.Contains(logs.String(), "using it anyway") || !strings.Contains(logs.String(), "could not reach Garmin") {
+		t.Errorf("the log should say the key could not be checked:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), goodKey) {
+		t.Errorf("key in log:\n%s", logs.String())
+	}
+
+	// Without the endpoint the server must still start, with the key.
+	_, logs2, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey}, "-garmin-url", unreachable, "-disable-auth-endpoint")
+	if !strings.Contains(logs2.String(), "key_loaded=true") {
+		t.Errorf("with -disable-auth-endpoint the key should be loaded:\n%s", logs2.String())
+	}
+}
+
+func TestReasonOf(t *testing.T) {
+	for err, want := range map[error]string{
+		nil:                      "",
+		auth.ErrInvalidKey:       "rejected by Garmin",
+		auth.ErrMalformedToken:   "unexpected answer from Garmin",
+		mcpserver.ErrKeyNotSaved: "could not save it to the key store",
+		context.DeadlineExceeded: "Garmin did not answer in time",
+		errors.New("dial tcp /secret/path: refused"): "could not reach Garmin",
+	} {
+		if got := reasonOf(err); got != want {
+			t.Errorf("reasonOf(%v) = %q, want %q", err, got, want)
+		}
 	}
 }
