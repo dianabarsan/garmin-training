@@ -37,7 +37,9 @@ Point your MCP client at `http://127.0.0.1:8808/mcp` (streamable HTTP).
 
 More ways to run it on your own machine (install as a command, a background service,
 Docker, trying it from claude.ai through a tunnel) are in
-[`docs/running-locally.md`](docs/running-locally.md).
+[`docs/running-locally.md`](docs/running-locally.md). To host it always-on for your phone,
+see [`docs/fly.md`](docs/fly.md) (Fly.io, no domain needed) or
+[`deploy/README.md`](deploy/README.md) (your own server with Caddy).
 
 ### The `/auth` endpoint
 
@@ -75,7 +77,7 @@ This server exposes your health data and accepts your Garmin key, so by default 
 built, by default, for a single user on one machine:
 
 - It binds to **loopback** and rejects requests whose `Host` header is not
-  `localhost`, `127.0.0.1` or `::1` (DNS-rebinding defence).
+  `localhost`, `127.0.0.1` or `::1` (DNS-rebinding defence), except `/healthz`, which only answers `ok`.
 - State-changing requests carrying a foreign `Origin` or a cross-site `Sec-Fetch-Site`
   are refused (browser CSRF defence).
 - It **refuses to start on a non-loopback address without `-token`**.

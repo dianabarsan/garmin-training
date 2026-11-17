@@ -375,7 +375,7 @@ func TestRun_AllowedHostsForReverseProxies(t *testing.T) {
 			"evil.example":                    403,
 			"garmin.example.com.evil.example": 403,
 		} {
-			if code, _ := get(t, base+"/healthz", map[string]string{"Host": host}); code != want {
+			if code, _ := get(t, base+"/auth", map[string]string{"Host": host}); code != want {
 				t.Errorf("%s: Host %q -> %d, want %d", name, host, code, want)
 			}
 		}
@@ -901,10 +901,42 @@ func TestRun_MultiUser_SecretsFromFilesAndAnExposedAddress(t *testing.T) {
 	if code, _ := adminCall(t, "GET", local+"/admin/users", "", cmdAdminToken); code != 200 {
 		t.Errorf("with the token read from a file: %d", code)
 	}
-	if code, _ := get(t, local+"/healthz", map[string]string{"Host": "garmin.example.com"}); code != 200 {
+	adminHdr := func(host string) map[string]string {
+		return map[string]string{"Host": host, "Authorization": "Bearer " + cmdAdminToken}
+	}
+	if code, _ := get(t, local+"/admin/users", adminHdr("garmin.example.com")); code != 200 {
 		t.Errorf("the public hostname: %d", code)
 	}
-	if code, _ := get(t, local+"/healthz", map[string]string{"Host": "evil.example"}); code != 403 {
+	if code, _ := get(t, local+"/admin/users", adminHdr("evil.example")); code != 403 {
 		t.Errorf("a foreign hostname: %d", code)
+	}
+}
+
+// Fly.io names the app in FLY_APP_NAME and serves it at <name>.fly.dev, so that
+// hostname is allowed without being configured twice.
+func TestRun_FlyAppNameAllowsItsHostname(t *testing.T) {
+	garminSrv, _ := fakeGarmin(t)
+	probe := func(env map[string]string, host string) int {
+		base, _, stop := start(t, env, "-garmin-url", garminSrv.URL)
+		defer stop()
+		code, _ := get(t, base+"/auth", map[string]string{"Host": host})
+		return code
+	}
+	fly := map[string]string{"FLY_APP_NAME": "my-garmin"}
+	if code := probe(fly, "my-garmin.fly.dev"); code != 200 {
+		t.Errorf("the app's own hostname: %d, want 200", code)
+	}
+	if code := probe(fly, "other-app.fly.dev"); code != 403 {
+		t.Errorf("another app's hostname: %d, want 403", code)
+	}
+	if code := probe(fly, "localhost"); code != 200 {
+		t.Errorf("localhost stays allowed: %d", code)
+	}
+	if code := probe(nil, "my-garmin.fly.dev"); code != 403 {
+		t.Errorf("without FLY_APP_NAME that hostname is not special: %d, want 403", code)
+	}
+	both := map[string]string{"FLY_APP_NAME": "my-garmin", "GARMIN_MCP_ALLOWED_HOSTS": "garmin.example.com"}
+	if probe(both, "garmin.example.com") != 200 || probe(both, "my-garmin.fly.dev") != 200 {
+		t.Error("a configured hostname and the Fly one should both be allowed")
 	}
 }

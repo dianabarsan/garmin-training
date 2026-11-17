@@ -17,6 +17,8 @@ phone / claude.ai ──https──▶ Caddy ──/mcp only──▶ garmin-mcp
 The Garmin key can therefore not be replaced from the internet, even with a leaked
 token. The server's own `/auth` is reachable only on the machine itself.
 
+(Prefer not to run a server yourself? [`docs/fly.md`](../docs/fly.md) hosts it on Fly.io.)
+
 ## What you need
 
 - A small Linux server with a public IP. Any provider and the smallest size are fine;

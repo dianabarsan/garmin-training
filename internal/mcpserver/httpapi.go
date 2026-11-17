@@ -60,7 +60,7 @@ func tokenDenialReason(r *http.Request) string {
 // hostGuard rejects requests whose Host header is not in allowed. It defends a
 // loopback-bound server against DNS rebinding, where a hostile web page makes
 // the browser send requests to localhost under an attacker-controlled name.
-// A nil or empty allowed set disables the check.
+// A nil or empty allowed set disables the check. /healthz is never refused.
 func hostGuard(allowed []string, audit *slog.Logger, next http.Handler) http.Handler {
 	if len(allowed) == 0 {
 		return next
@@ -70,6 +70,14 @@ func hostGuard(allowed []string, audit *slog.Logger, next http.Handler) http.Han
 		set[strings.ToLower(a)] = true
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The health check answers only "ok" and reveals nothing, so there is
+		// nothing for a rebinding attack to gain from it. Platform health checks
+		// (Fly, Kubernetes, load balancers) often send a Host header the operator
+		// cannot control, and a check that fails takes the server out of service.
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		host := r.Host
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h

@@ -39,3 +39,6 @@ testdata/live/
 # Deployment secrets
 deploy/secrets/
 deploy/.env
+
+# Secrets for `fly secrets import`
+fly-secrets.env

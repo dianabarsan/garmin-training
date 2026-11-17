@@ -167,6 +167,11 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 		return config{}, err
 	}
 	cfg.allowedHosts = splitList(allowedHosts)
+	// Fly.io tells every machine its app's name and serves the app at
+	// <name>.fly.dev, so that hostname can be allowed without being typed twice.
+	if app := strings.TrimSpace(getenv("FLY_APP_NAME")); app != "" {
+		cfg.allowedHosts = append(cfg.allowedHosts, app+".fly.dev")
+	}
 	return cfg, nil
 }
 

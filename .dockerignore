@@ -7,3 +7,4 @@ deploy/.env
 .env
 .git
 .idea
+fly-secrets.env

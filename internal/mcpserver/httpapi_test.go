@@ -245,7 +245,7 @@ func TestHostGuard_BlocksDNSRebinding(t *testing.T) {
 	h := newHarness(t)
 	base := serveHandler(t, h)
 	for _, host := range []string{"evil.example", "evil.example:8808", "169.254.169.254", "localhost.evil.example"} {
-		for _, p := range []string{"/", "/auth", "/mcp", "/healthz"} {
+		for _, p := range []string{"/", "/auth", "/mcp"} {
 			if code, _, _ := do(t, "GET", base+p, "", "", map[string]string{"Host": host}); code != http.StatusForbidden {
 				t.Errorf("Host %q on %s: %d, want 403", host, p, code)
 			}
@@ -414,12 +414,12 @@ func TestAllowedHosts_ForReverseProxies(t *testing.T) {
 	})
 	base := serveHandler(t, h)
 	for host, want := range map[string]int{
-		"garmin.example.com": 200, "garmin.example.com:443": 200, "GARMIN.EXAMPLE.COM": 200,
-		"other.example.org": 200, "other.example.org:8443": 200,
-		"localhost": 200, "127.0.0.1:8808": 200,
+		"garmin.example.com": 401, "garmin.example.com:443": 401, "GARMIN.EXAMPLE.COM": 401,
+		"other.example.org": 401, "other.example.org:8443": 401,
+		"localhost": 401, "127.0.0.1:8808": 401,
 		"evil.example": 403, "garmin.example.com.evil.example": 403, "example.com": 403,
 	} {
-		if code, _, _ := do(t, "GET", base+"/healthz", "", "", map[string]string{"Host": host}); code != want {
+		if code, _, _ := do(t, "GET", base+"/auth", "", "", map[string]string{"Host": host}); code != want {
 			t.Errorf("Host %q -> %d, want %d", host, code, want)
 		}
 	}
@@ -433,10 +433,10 @@ func TestAllowedHosts_AlsoApplyOnLoopbackBinds(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, func(c *Config) { c.AllowedHosts = []string{"garmin.example.com"} })
 	base := serveHandler(t, h)
-	if code, _, _ := do(t, "GET", base+"/healthz", "", "", map[string]string{"Host": "garmin.example.com"}); code != 200 {
+	if code, _, _ := do(t, "GET", base+"/auth", "", "", map[string]string{"Host": "garmin.example.com"}); code != 200 {
 		t.Errorf("the public name must be allowed in addition to loopback: %d", code)
 	}
-	if code, _, _ := do(t, "GET", base+"/healthz", "", "", map[string]string{"Host": "evil.example"}); code != 403 {
+	if code, _, _ := do(t, "GET", base+"/auth", "", "", map[string]string{"Host": "evil.example"}); code != 403 {
 		t.Errorf("other names stay blocked: %d", code)
 	}
 }
@@ -451,5 +451,36 @@ func TestAllowedHosts_RejectMalformedEntries(t *testing.T) {
 	}
 	if _, err := New(Config{API: h.srv.api, Credentials: h.creds, AllowedHosts: []string{"", "  "}}); err != nil {
 		t.Errorf("blank entries are ignored: %v", err)
+	}
+}
+
+// Platform health checks send whatever Host header the platform likes. The check
+// answers only "ok", so it is exempt from the Host guard on every kind of bind.
+func TestHealthzIgnoresTheHostHeader(t *testing.T) {
+	t.Parallel()
+	for name, opts := range map[string]func(*Config){
+		"loopback bind":            nil,
+		"allowed hosts configured": func(c *Config) { c.AllowedHosts = []string{"garmin.example.com"} },
+		"exposed bind with a token": func(c *Config) {
+			c.Addr = "0.0.0.0:8808"
+			c.Token = "tok"
+			c.AllowedHosts = []string{"garmin.example.com"}
+		},
+	} {
+		var o []harnessOpt
+		if opts != nil {
+			o = append(o, opts)
+		}
+		base := serveHandler(t, newHarness(t, o...))
+		for _, host := range []string{"10.0.0.7:8808", "fdaa:0:1::2", "evil.example", "localhost", ""} {
+			code, body, _ := do(t, "GET", base+"/healthz", "", "", map[string]string{"Host": host})
+			if code != 200 || strings.TrimSpace(body) != "ok" {
+				t.Errorf("%s: Host %q -> %d %q, want 200 ok", name, host, code, body)
+			}
+		}
+		// ... and nothing else is exempted by accident.
+		if code, _, _ := do(t, "GET", base+"/auth", "", "", map[string]string{"Host": "evil.example"}); code != 403 && code != 404 {
+			t.Errorf("%s: another path let a foreign Host through: %d", name, code)
+		}
 	}
 }

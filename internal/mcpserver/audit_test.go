@@ -166,7 +166,7 @@ func TestAudit_RefusedRequestsAreRecorded(t *testing.T) {
 
 	do(t, "POST", base+"/mcp", "application/json", `{}`, map[string]string{"User-Agent": "scanner/1.0", "X-Forwarded-For": "203.0.113.9"})
 	do(t, "GET", base+"/auth", "", "", map[string]string{"Authorization": "Bearer nope"})
-	do(t, "GET", base+"/healthz", "", "", map[string]string{"Host": "evil.example"})
+	do(t, "GET", base+"/mcp", "", "", map[string]string{"Host": "evil.example"})
 
 	denied := ac.events(t, "access_denied")
 	if len(denied) != 3 {
