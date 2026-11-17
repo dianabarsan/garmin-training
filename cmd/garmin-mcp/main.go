@@ -18,17 +18,15 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	garmin "github.com/dianabarsan/garmin-training"
-	"github.com/dianabarsan/garmin-training/internal/mcpserver"
+	"github.com/dianabarsan/garmin-training/cmd/garmin-mcp/internal/mcpserver"
+	garminconnect "github.com/dianabarsan/garmin-training/garmin-connect"
 )
 
 // version is set at build time: -ldflags "-X main.version=v1.2.3".
@@ -41,21 +39,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "garmin-mcp:", err)
 		os.Exit(1)
 	}
-}
-
-// config is everything run needs, gathered from flags and the environment.
-type config struct {
-	addr         string
-	token        string
-	allowedHosts []string
-	keyStore     string
-	auditLog     string
-	garminURL    string
-	logLevel     string
-	envKey       string // initial API key from GARMIN_PERSONAL_API_KEY[_FILE]
-	disableAuth  bool   // serve no /auth endpoint or key page
-	healthcheck  bool
-	showVersion  bool
 }
 
 // run starts the server and blocks until ctx is cancelled or serving fails.
@@ -109,85 +92,6 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	return serve(ctx, ln, srv.Handler())
 }
 
-// parseConfig reads flags and the environment. It returns flag.ErrHelp when
-// help was requested. Secrets may come from the environment or, safer in
-// containers, from a file named by NAME_FILE (the Docker secrets convention).
-func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (config, error) {
-	tokenDefault, err := secret(getenv, "GARMIN_MCP_TOKEN")
-	if err != nil {
-		return config{}, err
-	}
-	envKey, err := secret(getenv, "GARMIN_PERSONAL_API_KEY")
-	if err != nil {
-		return config{}, err
-	}
-	disableDefault, err := boolEnv(getenv, "GARMIN_MCP_DISABLE_AUTH_ENDPOINT")
-	if err != nil {
-		return config{}, err
-	}
-
-	fs := flag.NewFlagSet("garmin-mcp", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	cfg := config{envKey: envKey}
-	var allowedHosts string
-	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8808", "address to listen on; a non-loopback address requires -token")
-	fs.StringVar(&cfg.token, "token", tokenDefault, "require this bearer token on /mcp and /auth (env GARMIN_MCP_TOKEN or GARMIN_MCP_TOKEN_FILE)")
-	fs.StringVar(&allowedHosts, "allowed-host", getenv("GARMIN_MCP_ALLOWED_HOSTS"), "comma-separated public hostnames this server may be reached as, e.g. garmin.example.com; set it behind a reverse proxy (env GARMIN_MCP_ALLOWED_HOSTS)")
-	fs.BoolVar(&cfg.disableAuth, "disable-auth-endpoint", disableDefault, "do not serve /auth or the key page (both answer 404), so the key can only come from GARMIN_PERSONAL_API_KEY[_FILE] or -key-store; use it when the server is reachable from outside (env GARMIN_MCP_DISABLE_AUTH_ENDPOINT)")
-	fs.BoolVar(&cfg.healthcheck, "healthcheck", false, "probe a running server at -addr and exit 0 if it is healthy (for container health checks)")
-	fs.StringVar(&cfg.keyStore, "key-store", getenv("GARMIN_MCP_KEY_STORE"), "file in which to keep the API key between restarts, mode 0600 (env GARMIN_MCP_KEY_STORE); the key stays in memory only when unset")
-	fs.StringVar(&cfg.auditLog, "audit-log", getenv("GARMIN_MCP_AUDIT_LOG"), "append the audit trail (tool calls, refused requests, key changes) to this file as JSON lines, mode 0600; without it the records appear in the normal log tagged audit=true (env GARMIN_MCP_AUDIT_LOG)")
-	fs.StringVar(&cfg.garminURL, "garmin-url", getenv("GARMIN_PERSONAL_API_BASE_URL"), "Garmin API base URL; for testing")
-	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
-	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
-	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth\n(unless -disable-auth-endpoint is set).\n\nFlags:\n")
-		fs.PrintDefaults()
-	}
-	if err := fs.Parse(args); err != nil {
-		return config{}, err
-	}
-	cfg.allowedHosts = splitList(allowedHosts)
-	// Fly.io tells every machine its app's name and serves the app at
-	// <name>.fly.dev, so that hostname can be allowed without being typed twice.
-	if app := strings.TrimSpace(getenv("FLY_APP_NAME")); app != "" {
-		cfg.allowedHosts = append(cfg.allowedHosts, app+".fly.dev")
-	}
-	return cfg, nil
-}
-
-// newLogger builds the text logger for the given level name.
-func newLogger(level string, w io.Writer) (*slog.Logger, error) {
-	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(level)); err != nil {
-		return nil, fmt.Errorf("invalid -log-level %q", level)
-	}
-	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl})), nil
-}
-
-// newAuditLogger returns the logger for the audit trail and a function that
-// closes it. With a path, records are appended to that file as JSON lines (the
-// file is created mode 0600, its directory 0700). Without one they go to the
-// normal log tagged audit=true.
-func newAuditLogger(path string, ops *slog.Logger) (*slog.Logger, func(), error) {
-	if path == "" {
-		return ops.With("audit", true), func() {}, nil
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("-audit-log: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
-		return nil, nil, fmt.Errorf("-audit-log: %w", err)
-	}
-	f, err := os.OpenFile(abs, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, nil, fmt.Errorf("-audit-log: %w", err)
-	}
-	logger := slog.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	return logger, func() { _ = f.Close() }, nil
-}
-
 // newServer wires the credentials, the Garmin client and the MCP server.
 func newServer(cfg config, log, audit *slog.Logger) (*mcpserver.Credentials, *mcpserver.Server, error) {
 	credOpts := []mcpserver.CredentialsOption{}
@@ -203,12 +107,12 @@ func newServer(cfg config, log, audit *slog.Logger) (*mcpserver.Credentials, *mc
 	}
 	creds := mcpserver.NewCredentials(credOpts...)
 
-	clientOpts := []garmin.Option{garmin.WithTokenSource(creds), garmin.WithUserAgent("garmin-mcp/" + version)}
+	clientOpts := []garminconnect.Option{garminconnect.WithTokenSource(creds), garminconnect.WithUserAgent("garmin-mcp/" + version)}
 	if cfg.garminURL != "" {
-		clientOpts = append(clientOpts, garmin.WithBaseURL(cfg.garminURL))
+		clientOpts = append(clientOpts, garminconnect.WithBaseURL(cfg.garminURL))
 	}
 	srv, err := mcpserver.New(mcpserver.Config{
-		API:                 garmin.New(clientOpts...),
+		API:                 garminconnect.New(clientOpts...),
 		Credentials:         creds,
 		Token:               cfg.token,
 		Addr:                cfg.addr,
@@ -255,126 +159,10 @@ func loadInitialKey(ctx context.Context, creds *mcpserver.Credentials, envKey st
 	return ok
 }
 
-// serve runs the HTTP server on ln until ctx is cancelled, then shuts it down.
-func serve(ctx context.Context, ln net.Listener, handler http.Handler) error {
-	// Every request context derives from connCtx, so cancelling it ends open
-	// event streams, which would otherwise hold a graceful shutdown for its
-	// full timeout.
-	connCtx, cancelConns := context.WithCancel(context.Background())
-	defer cancelConns()
-	httpSrv := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		BaseContext:       func(net.Listener) context.Context { return connCtx },
-		// No WriteTimeout: MCP responses can be long-lived event streams.
-	}
-	errc := make(chan error, 1)
-	go func() { errc <- httpSrv.Serve(ln) }()
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
-	}
-	return shutdown(httpSrv, cancelConns, errc)
-}
-
-// shutdown stops the server gracefully: in-flight requests get a second to
-// finish, then the remaining connections (typically idle MCP event streams)
-// are cancelled, and anything still open after five seconds is closed.
-func shutdown(srv *http.Server, cancelConns context.CancelFunc, serveErr <-chan error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- srv.Shutdown(ctx) }()
-	var err error
-	select {
-	case err = <-done:
-	case <-time.After(time.Second):
-		cancelConns()
-		err = <-done
-	}
-	if err != nil {
-		_ = srv.Close()
-	}
-	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
-	return nil
-}
-
 // reasonOf gives a log-safe reason for a rejected key.
 func reasonOf(err error) string {
 	if err == nil {
 		return ""
 	}
 	return strings.SplitN(err.Error(), ":", 2)[0]
-}
-
-// secret returns the value of NAME, or the trimmed contents of the file named
-// by NAME_FILE. Setting both is an error, so the source is never ambiguous.
-func secret(getenv func(string) string, name string) (string, error) {
-	v, f := strings.TrimSpace(getenv(name)), strings.TrimSpace(getenv(name+"_FILE"))
-	switch {
-	case v != "" && f != "":
-		return "", fmt.Errorf("set only one of %s and %s_FILE", name, name)
-	case f != "":
-		b, err := os.ReadFile(f)
-		if err != nil {
-			return "", fmt.Errorf("reading %s_FILE: %w", name, err)
-		}
-		return strings.TrimSpace(string(b)), nil
-	}
-	return v, nil
-}
-
-// splitList splits a comma-separated list, dropping blanks.
-func splitList(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// boolEnv reads an optional boolean environment variable; unset means false.
-func boolEnv(getenv func(string) string, name string) (bool, error) {
-	v := strings.TrimSpace(getenv(name))
-	if v == "" {
-		return false, nil
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("%s must be true or false, got %q", name, v)
-	}
-	return b, nil
-}
-
-// probeHealth GETs /healthz on a server listening at addr. A wildcard or empty
-// host (":8808", "0.0.0.0:8808") is probed through loopback.
-func probeHealth(ctx context.Context, addr string) error {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("-addr: %w", err)
-	}
-	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
-		host = "127.0.0.1"
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+net.JoinHostPort(host, port)+"/healthz", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("unhealthy: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unhealthy: /healthz returned %d", resp.StatusCode)
-	}
-	return nil
 }

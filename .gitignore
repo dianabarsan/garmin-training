@@ -34,7 +34,7 @@ token
 # .vscode/
 
 # Raw live API responses (personal data: GPS, heart rate). Never commit.
-testdata/live/
+**/testdata/live/
 
 # Deployment secrets
 deploy/secrets/
@@ -42,3 +42,9 @@ deploy/.env
 
 # Secrets for `fly secrets import`
 fly-secrets.env
+
+# Fly app config: names the personal app, so each deployer writes their own (docs/fly.md)
+fly.toml
+
+# IDE settings (personal)
+.idea/

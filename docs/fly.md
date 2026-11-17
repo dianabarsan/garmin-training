@@ -58,12 +58,46 @@ The shell fills in the values, so neither appears in your shell history or a pro
 
 ## 3. Create the app
 
-Choose a name that is unique across Fly, for example `garmin-mcp-yourname`:
+Choose a name that is unique across Fly, for example `garmin-mcp-yourname`, and write the
+app's `fly.toml` in the repository root. The file names your app, so it is git-ignored:
+each deployer keeps their own.
 
 ```sh
 APP=garmin-mcp-yourname
+cat > fly.toml <<EOF
+app = '$APP'
+primary_region = 'ams'
+
+[experimental]
+  cmd = ['-addr', ':8808']
+
+[build]
+  dockerfile = 'deploy/Dockerfile'
+
+[env]
+  GARMIN_MCP_DISABLE_AUTH_ENDPOINT = 'true'
+
+[http_service]
+  internal_port = 8808
+  force_https = true
+  auto_stop_machines = 'suspend'
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/healthz'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+EOF
+cp fly.toml fly.toml.orig
 fly launch --copy-config --no-deploy --name "$APP" --region ams --ha=false --yes
-git diff fly.toml
+diff fly.toml.orig fly.toml; rm fly.toml.orig
 ```
 
 `--ha=false` matters: by default Fly creates two machines, and this server keeps its MCP

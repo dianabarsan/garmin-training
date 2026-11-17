@@ -8,11 +8,9 @@ FROM golang:${GO_VERSION} AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-# Only the source directories are copied, so a stray `key` file or captured
-# data in the repository can never end up in the image.
-COPY *.go ./
-COPY auth ./auth
-COPY internal ./internal
+# Only the source directories are copied, so a stray `key` file in the root cannot
+# end up in the image; .dockerignore keeps captured data (testdata/live) out.
+COPY garmin-connect ./garmin-connect
 COPY cmd ./cmd
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/garmin-mcp ./cmd/garmin-mcp

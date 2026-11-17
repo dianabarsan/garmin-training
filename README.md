@@ -3,10 +3,12 @@
 A Go client for the **Garmin Connect Personal API** (your own data, pull-based, no
 developer-program approval), and an **MCP server** that lets AI agents read it.
 
-- `github.com/dianabarsan/garmin-training` is an importable library. The root
-  package depends on the standard library only.
-- `cmd/garmin-mcp` is the MCP server. It is the only place that uses a third-party
-  module (the official MCP Go SDK).
+- `garmin-connect/` is an importable library, `github.com/dianabarsan/garmin-training/garmin-connect`
+  (package `garminconnect`), with its token handling in `garmin-connect/auth`. It depends on
+  the standard library only.
+- `cmd/garmin-mcp/` is the MCP server: `main.go` starts the process, and
+  `internal/mcpserver` holds the tools and HTTP routes. It is the only place that uses a
+  third-party module (the official MCP Go SDK).
 
 The Personal API is for one person's own data. Garmin's terms do not allow it in
 commercial multi-user applications.
@@ -172,10 +174,15 @@ ask you for the key; an agent cannot provide it itself.
 ## The library
 
 ```go
-ts := auth.NewTokenSource(os.Getenv("GARMIN_PERSONAL_API_KEY"))
-c := garmin.New(garmin.WithTokenSource(ts))
+import (
+	garminconnect "github.com/dianabarsan/garmin-training/garmin-connect"
+	"github.com/dianabarsan/garmin-training/garmin-connect/auth"
+)
 
-acts, err := c.Activities(ctx, garmin.ActivitiesOptions{SubTypeKey: "strength_training", Limit: 5})
+ts := auth.NewTokenSource(os.Getenv("GARMIN_PERSONAL_API_KEY"))
+c := garminconnect.New(garminconnect.WithTokenSource(ts))
+
+acts, err := c.Activities(ctx, garminconnect.ActivitiesOptions{SubTypeKey: "strength_training", Limit: 5})
 series, err := c.ActivitySeries(ctx, acts[0].ID)
 splits, err := series.Splits(1000)
 ```
@@ -196,10 +203,10 @@ Live checks against your own account are behind the `live` build tag and read th
 from a file named `key` in the repository root (git-ignored):
 
 ```sh
-go test -tags live -run TestLive -v ./cmd/garmin-mcp   # the server, every tool
-go test -tags live -run TestLiveTyped -v .             # the library
+go test -tags live -run TestLive -v ./cmd/garmin-mcp        # the server, every tool
+go test -tags live -run TestLiveTyped -v ./garmin-connect   # the library
 ```
 
-`testdata/shapes/` holds the structure of real responses with every value blanked.
-`testdata/live/` (git-ignored) is where raw captures go; it can contain GPS and health
+`garmin-connect/testdata/shapes/` holds the structure of real responses with every value blanked.
+`garmin-connect/testdata/live/` (git-ignored) is where raw captures go; it can contain GPS and health
 data and must not be committed.
