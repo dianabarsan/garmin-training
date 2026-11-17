@@ -1,7 +1,7 @@
 # Never let secrets or personal captures into a build context or image.
-key
-*.key
-token
+**/key
+**/*.key
+**/token
 **/testdata/live
 deploy/secrets
 deploy/.env

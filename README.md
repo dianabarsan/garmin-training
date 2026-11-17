@@ -6,8 +6,8 @@ developer-program approval), and an **MCP server** that lets AI agents read it.
 - `garmin-connect/` is an importable library, `github.com/dianabarsan/garmin-training/garmin-connect`
   (package `garminconnect`), with its token handling in `garmin-connect/auth`. It depends on
   the standard library only.
-- `cmd/garmin-mcp/` is the MCP server: `main.go` starts the process, and
-  `internal/mcpserver` holds the tools and HTTP routes. It is the only place that uses a
+- `cmd/garmin-mcp/` is the MCP server: the `main` package handles configuration, logging,
+  listening and shutdown, and `internal/mcpserver` holds the tools and HTTP routes. It is the only place that uses a
   third-party module (the official MCP Go SDK).
 
 The Personal API is for one person's own data. Garmin's terms do not allow it in

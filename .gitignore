@@ -45,6 +45,7 @@ fly-secrets.env
 
 # Fly app config: names the personal app, so each deployer writes their own (docs/fly.md)
 fly.toml
+fly.toml.orig
 
 # IDE settings (personal)
 .idea/
