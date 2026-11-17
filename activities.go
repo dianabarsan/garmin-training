@@ -161,6 +161,25 @@ type ActivityDetail struct {
 	Type     ActivityType
 	Summary  ActivityMetrics
 	TimeZone string
+	// Sensors lists the external sensors paired during the activity, such as
+	// a chest strap or a power meter. The watch itself is not listed.
+	Sensors []Sensor
+}
+
+// Sensor is an external sensor recorded with an activity. String fields hold
+// Garmin's enum names verbatim, e.g. "POLAR_ELECTRO", "ANTPLUS", "HEART_RATE".
+type Sensor struct {
+	Manufacturer string `json:"manufacturer"`
+	// SourceType is the connection: "ANTPLUS", "BLUETOOTH_LOW_ENERGY", ...
+	SourceType string `json:"sourceType"`
+	// DeviceType is what the sensor measures, e.g. "HEART_RATE" or "BIKE_POWER".
+	DeviceType      string  `json:"antplusDeviceType"`
+	SoftwareVersion float64 `json:"softwareVersion"`
+	SerialNumber    int64   `json:"serialNumber"`
+	// BatteryStatus is Garmin's label ("OK", "LOW", ...); BatteryLevel is a
+	// percentage, nil when the sensor does not report one.
+	BatteryStatus string `json:"batteryStatus"`
+	BatteryLevel  *int   `json:"batteryLevel"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -177,11 +196,15 @@ func (d *ActivityDetail) UnmarshalJSON(b []byte) error {
 		TimeZone struct {
 			TimeZone string `json:"timeZone"`
 		} `json:"timeZoneUnitDTO"`
+		Metadata struct {
+			Sensors []Sensor `json:"sensors"`
+		} `json:"metadataDTO"`
 	}
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
 	d.ID, d.Name, d.Type = aux.ID, aux.Name, aux.Type
+	d.Sensors = aux.Metadata.Sensors
 	d.Summary = aux.Summary.ActivityMetrics
 	d.Summary.normalize()
 	if d.Summary.AerobicTrainingEffect == 0 {

@@ -243,7 +243,9 @@ func TestTools_GetActivity(t *testing.T) {
 	cs := h.connect(t)
 	h.fg.route("/activity-service/activity/42", `{"activityId":42,"activityName":"Morning Run","activityTypeDTO":{"typeKey":"running"},
 	  "timeZoneUnitDTO":{"timeZone":"Europe/Bucharest"},
-	  "summaryDTO":{"startTimeGMT":"2026-11-14 07:00:00.0","distance":20335.37,"duration":6476.17,"averageHR":175,"elevationGain":125,"trainingEffect":4.1}}`)
+	  "summaryDTO":{"startTimeGMT":"2026-11-14 07:00:00.0","distance":20335.37,"duration":6476.17,"averageHR":175,"elevationGain":125,"trainingEffect":4.1},
+	  "metadataDTO":{"sensors":[{"manufacturer":"POLAR_ELECTRO","serialNumber":424242,"sourceType":"ANTPLUS","antplusDeviceType":"HEART_RATE",
+	    "softwareVersion":1.0,"batteryStatus":"OK","batteryLevel":90}]}}`)
 	type out struct {
 		ID        int64   `json:"id"`
 		Type      string  `json:"type"`
@@ -251,10 +253,43 @@ func TestTools_GetActivity(t *testing.T) {
 		DistanceM float64 `json:"distance_m"`
 		Aerobic   float64 `json:"aerobic_training_effect"`
 		Start     string  `json:"start_time"`
+		Sensors   []struct {
+			Type, Manufacturer, Connection string
+			BatteryStatus                  string  `json:"battery_status"`
+			SoftwareVersion                float64 `json:"software_version"`
+			BatteryPercent                 *int    `json:"battery_percent"`
+		} `json:"sensors"`
 	}
-	got := decodeResult[out](t, callTool(t, cs, "get_activity", map[string]any{"activity_id": 42}))
+	res := callTool(t, cs, "get_activity", map[string]any{"activity_id": 42})
+	got := decodeResult[out](t, res)
 	if got.ID != 42 || got.Type != "running" || got.TimeZone != "Europe/Bucharest" || got.DistanceM != 20335.4 || got.Aerobic != 4.1 || got.Start != "2026-11-14T07:00:00Z" {
 		t.Errorf("got %+v", got)
+	}
+	if len(got.Sensors) != 1 {
+		t.Fatalf("sensors = %+v", got.Sensors)
+	}
+	if s := got.Sensors[0]; s.Type != "HEART_RATE" || s.Manufacturer != "POLAR_ELECTRO" || s.Connection != "ANTPLUS" ||
+		s.BatteryStatus != "OK" || s.SoftwareVersion != 1 || s.BatteryPercent == nil || *s.BatteryPercent != 90 {
+		t.Errorf("sensor = %+v", s)
+	}
+	// Every field Garmin sent, including those without a curated equivalent,
+	// arrives unmodified under "raw".
+	type rawOut struct {
+		Raw struct {
+			Metadata struct {
+				Sensors []struct {
+					Serial int64 `json:"serialNumber"`
+				} `json:"sensors"`
+			} `json:"metadataDTO"`
+			Summary map[string]any `json:"summaryDTO"`
+		} `json:"raw"`
+	}
+	whole := decodeResult[rawOut](t, res)
+	if s := whole.Raw.Metadata.Sensors; len(s) != 1 || s[0].Serial != 424242 {
+		t.Errorf("raw.metadataDTO.sensors = %+v", s)
+	}
+	if whole.Raw.Summary["trainingEffect"] != 4.1 {
+		t.Errorf("raw.summaryDTO = %v", whole.Raw.Summary)
 	}
 	if res := callTool(t, cs, "get_activity", map[string]any{"activity_id": 999}); !res.IsError || !strings.Contains(resultText(res), "not found") {
 		t.Errorf("unknown id: %q", resultText(res))

@@ -61,6 +61,7 @@ func TestLiveAllTools(t *testing.T) {
 			return nil, false
 		}
 		b, _ := json.Marshal(res.StructuredContent)
+		t.Logf("%-22s %7d bytes of output", name, len(b))
 		var m map[string]any
 		_ = json.Unmarshal(b, &m)
 		return m, true

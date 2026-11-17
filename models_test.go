@@ -274,10 +274,24 @@ func TestActivityDetail(t *testing.T) {
 	  "activityTypeDTO": {"typeId": 1, "typeKey": "running", "parentTypeId": 17},
 	  "summaryDTO": {"startTimeGMT": "2026-11-15 06:30:05.0", "distance": 5000, "minHR": 90, "trainingEffect": 2.7,
 	                 "averageMovingSpeed": 3.1},
-	  "timeZoneUnitDTO": {"timeZone": "Europe/Bucharest"}, "extra": true}`)
+	  "timeZoneUnitDTO": {"timeZone": "Europe/Bucharest"}, "extra": true,
+	  "metadataDTO": {"sensors": [
+	    {"manufacturer": "POLAR_ELECTRO", "serialNumber": 123, "sourceType": "ANTPLUS", "antplusDeviceType": "HEART_RATE",
+	     "softwareVersion": 1.0, "batteryStatus": "OK", "batteryLevel": 90},
+	    {"manufacturer": "GARMIN", "sourceType": "BLUETOOTH_LOW_ENERGY", "antplusDeviceType": "FOOTPOD", "batteryLevel": null}]}}`)
 	d, err := c.ActivityDetail(context.Background(), 9001)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(d.Sensors) != 2 {
+		t.Fatalf("sensors = %+v", d.Sensors)
+	}
+	if s := d.Sensors[0]; s.Manufacturer != "POLAR_ELECTRO" || s.SourceType != "ANTPLUS" || s.DeviceType != "HEART_RATE" ||
+		s.SoftwareVersion != 1 || s.SerialNumber != 123 || s.BatteryStatus != "OK" || s.BatteryLevel == nil || *s.BatteryLevel != 90 {
+		t.Errorf("sensor 0 = %+v", s)
+	}
+	if s := d.Sensors[1]; s.DeviceType != "FOOTPOD" || s.BatteryLevel != nil {
+		t.Errorf("sensor 1 = %+v (null battery level must stay nil)", s)
 	}
 	if last.URL.Path != "/activity-service/activity/9001" {
 		t.Errorf("path = %s", last.URL.Path)
@@ -412,19 +426,25 @@ func TestDailySummaries_EmptyAndRange(t *testing.T) {
 
 func TestStepsAndStress(t *testing.T) {
 	t.Parallel()
-	c, last := serve(t, `[{"calendarDate":"2026-11-14","totalSteps":9000,"stepGoal":8000,"totalDistance":6500.5}]`)
+	c, last := serve(t, `[{"calendarDate":"2026-11-14","totalSteps":9000,"stepGoal":8000,"totalDistance":6500.5,"unmapped":1}]`)
 	steps, err := c.Steps(context.Background(), d1, d2)
 	if err != nil || len(steps) != 1 || steps[0].TotalSteps != 9000 || steps[0].TotalDistance != 6500.5 {
 		t.Fatalf("steps = %+v err %v", steps, err)
+	}
+	if !strings.Contains(string(steps[0].Raw()), `"unmapped":1`) {
+		t.Errorf("steps raw = %s", steps[0].Raw())
 	}
 	if last.URL.Path != "/usersummary-service/stats/steps/daily/2026-11-09/2026-11-15" {
 		t.Errorf("path = %s", last.URL.Path)
 	}
 
-	c2, last2 := serve(t, `[{"calendarDate":"2026-11-14","values":{"overallStressLevel":33,"restStressDuration":100,"highStressDuration":50}}]`)
+	c2, last2 := serve(t, `[{"calendarDate":"2026-11-14","values":{"overallStressLevel":33,"restStressDuration":100,"highStressDuration":50},"unmapped":2}]`)
 	st, err := c2.Stress(context.Background(), d1, d2)
 	if err != nil || len(st) != 1 || st[0].Values.OverallLevel != 33 || st[0].Values.HighSeconds != 50 {
 		t.Fatalf("stress = %+v err %v", st, err)
+	}
+	if !strings.Contains(string(st[0].Raw()), `"unmapped":2`) {
+		t.Errorf("stress raw = %s", st[0].Raw())
 	}
 	if last2.URL.Path != "/usersummary-service/stats/stress/daily/2026-11-09/2026-11-15" {
 		t.Errorf("path = %s", last2.URL.Path)
@@ -919,6 +939,9 @@ func TestHRVRange(t *testing.T) {
 	}
 	if b.Status != "UNBALANCED" || b.Baseline != nil || b.LastNightAvg != 39 {
 		t.Errorf("second = %+v", b)
+	}
+	if r := string(a.Raw()); !strings.Contains(r, `"markerValue":0.55`) || strings.Contains(r, "2026-11-15") {
+		t.Errorf("each summary must keep exactly its own raw object, got %s", r)
 	}
 	if _, err := c.HRVRange(context.Background(), d2, d1); !errors.Is(err, garmin.ErrInvalidRange) {
 		t.Errorf("err = %v", err)

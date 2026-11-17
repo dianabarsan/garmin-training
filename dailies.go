@@ -152,6 +152,7 @@ func (c *Client) dailySummaries(ctx context.Context, start, end time.Time) ([]Da
 
 // StepsDay is one day of the step statistics endpoint.
 type StepsDay struct {
+	rawJSON
 	CalendarDate  string  `json:"calendarDate"`
 	TotalSteps    int     `json:"totalSteps"`
 	StepGoal      int     `json:"stepGoal"`
@@ -169,16 +170,21 @@ func (c *Client) steps(ctx context.Context, start, end time.Time) ([]StepsDay, e
 	if err := checkRange(start, end); err != nil {
 		return nil, err
 	}
-	var out []StepsDay
+	var raw json.RawMessage
 	path := "/usersummary-service/stats/steps/daily/" + dateParam(start) + "/" + dateParam(end)
-	if err := c.get(ctx, path, nil, &out); err != nil {
+	if err := c.get(ctx, path, nil, &raw); err != nil {
 		return nil, err
+	}
+	out, err := decodeList[StepsDay](raw)
+	if err != nil {
+		return nil, fmt.Errorf("garmin: decoding steps: %w", err)
 	}
 	return out, nil
 }
 
 // StressDay is one day of the stress statistics endpoint.
 type StressDay struct {
+	rawJSON
 	CalendarDate string       `json:"calendarDate"`
 	Values       StressValues `json:"values"`
 }
@@ -243,10 +249,14 @@ func (c *Client) stress(ctx context.Context, start, end time.Time) ([]StressDay,
 	if err := checkRange(start, end); err != nil {
 		return nil, err
 	}
-	var out []StressDay
+	var raw json.RawMessage
 	path := "/usersummary-service/stats/stress/daily/" + dateParam(start) + "/" + dateParam(end)
-	if err := c.get(ctx, path, nil, &out); err != nil {
+	if err := c.get(ctx, path, nil, &raw); err != nil {
 		return nil, err
+	}
+	out, err := decodeList[StressDay](raw)
+	if err != nil {
+		return nil, fmt.Errorf("garmin: decoding stress: %w", err)
 	}
 	return out, nil
 }

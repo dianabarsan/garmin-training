@@ -210,6 +210,24 @@ default to the last 7 days ending today and accept up to 366 days.
 | `get_vo2max` | VO2 max history. |
 | `get_heart_rate_zones` | Zones as bpm ranges for a sport. |
 
+**Raw data.** Besides the cleaned-up fields above, every item a tool returns carries
+Garmin's complete, unmodified record under `raw`: every field Garmin sent, including those
+the curated fields leave out (for example an activity's sensors, lap count or running
+dynamics). Every tool that returns it takes `include_raw_data` (default `true`); set it to
+`false` to get only the cleaned-up fields. `get_activity_splits` and `get_activity_series`
+have no raw data: they are computed from the per-second data, which is several megabytes
+per activity and holds the full GPS track, so it is not passed through. Two consequences
+of the default:
+
+- **Location.** Activity records include the start and end coordinates
+  (`startLatitude`, `startLongitude`, `endLatitude`, `endLongitude`) and `locationName`. For
+  runs that start at home, that is your home address, and it becomes part of the
+  conversation.
+- **Size.** Outputs are several times larger. Measured on a real account: 7 days of sleep
+  about 50 KB, 7 days of daily summaries about 53 KB, 10 activities about 39 KB, and a
+  year of sleep about 1.25 MB, which is more than an agent can take in at once. For long
+  ranges, ask for shorter ones or for `include_raw_data: false`.
+
 If a tool is called before a key is provided, it returns an error telling the agent to
 ask you for the key; an agent cannot provide it itself.
 

@@ -106,6 +106,7 @@ type HRVBaseline struct {
 // HRVSummary is Garmin's overnight heart-rate-variability rollup, in
 // milliseconds.
 type HRVSummary struct {
+	rawJSON
 	CalendarDate      string       `json:"calendarDate"`
 	WeeklyAvg         int          `json:"weeklyAvg"`
 	LastNightAvg      int          `json:"lastNightAvg"`
@@ -263,11 +264,15 @@ func (c *Client) HRVRange(ctx context.Context, start, end time.Time) ([]HRVSumma
 		return nil, err
 	}
 	var env struct {
-		Summaries []HRVSummary `json:"hrvSummaries"`
+		Summaries json.RawMessage `json:"hrvSummaries"`
 	}
 	path := "/hrv-service/hrv/daily/" + dateParam(start) + "/" + dateParam(end)
 	if err := c.get(ctx, path, nil, &env); err != nil {
 		return nil, err
 	}
-	return env.Summaries, nil
+	out, err := decodeList[HRVSummary](env.Summaries)
+	if err != nil {
+		return nil, fmt.Errorf("garmin: decoding HRV range: %w", err)
+	}
+	return out, nil
 }

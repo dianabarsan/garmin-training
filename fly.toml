@@ -1,48 +1,37 @@
-# Fly.io configuration for the Garmin MCP server in its default single-user form.
-# The step-by-step guide is docs/fly.md; do not deploy before reading it.
+# fly.toml app configuration file generated for garmin-mcp-twisteddiana on 2026-11-17T09:57:40+02:00
 #
-# There is deliberately no `app = "..."` line: you pass your app's name with -a, so this
-# file never needs editing for a name.
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
+#
+
+app = 'garmin-mcp-twisteddiana'
+primary_region = 'ams'
+
+[experimental]
+  cmd = ['-addr', ':8808']
 
 [build]
-  # The Dockerfile expects the repository root as its build context, which is
-  # what Fly uses by default.
-  dockerfile = "deploy/Dockerfile"
-
-# The image's default command also passes -key-store, which would write your Garmin
-# key to the machine's disk. This keeps only the address; the key comes from a
-# Fly secret instead.
-[experimental]
-  cmd = ["-addr", ":8808"]
+  dockerfile = 'deploy/Dockerfile'
 
 [env]
-  # /auth and the key page do not exist, so a leaked token can read data but can
-  # never replace your key.
-  GARMIN_MCP_DISABLE_AUTH_ENDPOINT = "true"
-  # The server also allows <app name>.fly.dev by itself, using FLY_APP_NAME. Add a
-  # custom domain here if you attach one:
-  # GARMIN_MCP_ALLOWED_HOSTS = "garmin.example.com"
-  #
-  # Secrets (set with `fly secrets import`, never written here):
-  #   GARMIN_MCP_TOKEN          the bearer token Claude sends
-  #   GARMIN_PERSONAL_API_KEY   your Garmin Personal API key
+  GARMIN_MCP_DISABLE_AUTH_ENDPOINT = 'true'
 
 [http_service]
   internal_port = 8808
   force_https = true
-  # Always on: a phone connector must work when nothing has called for hours. Stopping
-  # and starting are both turned off, as Fly's docs recommend doing together.
-  auto_stop_machines = "off"
-  auto_start_machines = false
-  min_machines_running = 1
+  # Suspend when idle and wake on the next request. A suspended machine resumes from a
+  # memory snapshot, so MCP sessions and the cached Garmin token survive the pause.
+  # min_machines_running must be 0, or the proxy never suspends the only machine.
+  auto_stop_machines = 'suspend'
+  auto_start_machines = true
+  min_machines_running = 0
 
   [[http_service.checks]]
-    grace_period = "10s"
-    interval = "30s"
-    method = "GET"
-    timeout = "5s"
-    path = "/healthz"
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/healthz'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+  size = 'shared-cpu-1x'
+  memory = '256mb'

@@ -115,7 +115,9 @@ in the conversation.
   Anyone with root on the server can read it. Use a provider you trust, keep the OS
   updated (for example `unattended-upgrades`), and use SSH keys only.
 - **Data in transit to Claude:** whatever a tool returns becomes part of your Claude
-  conversation. The tools are read-only and never return GPS coordinates.
+  conversation. The tools are read-only. They never return a GPS track, but each
+  activity's raw data includes its start and end coordinates (see "Raw data" in the main
+  README).
 - **Removing `/auth` altogether (optional):** Caddy already hides it from the internet. If
   you want it gone from the server too, add `-disable-auth-endpoint` to the
   `garmin-mcp` service's `command` in `compose.yaml` (for example

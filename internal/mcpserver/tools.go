@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -98,8 +99,9 @@ func (s *Server) oneDate(date string) (time.Time, error) {
 
 // rangeIn is the input shared by every date-range tool.
 type rangeIn struct {
-	Start string `json:"start,omitempty" jsonschema:"first day, YYYY-MM-DD. Defaults to 6 days before end."`
-	End   string `json:"end,omitempty" jsonschema:"last day, YYYY-MM-DD. Defaults to today."`
+	Start          string `json:"start,omitempty" jsonschema:"first day, YYYY-MM-DD. Defaults to 6 days before end."`
+	End            string `json:"end,omitempty" jsonschema:"last day, YYYY-MM-DD. Defaults to today."`
+	IncludeRawData *bool  `json:"include_raw_data,omitempty" jsonschema:"also return Garmin's complete, unmodified record for each item under raw. Default true. Set false for long ranges: the raw records make the output several times larger."`
 }
 
 // --- activities ----------------------------------------------------------------
@@ -141,6 +143,34 @@ type ActivityOut struct {
 	TotalSets         int           `json:"total_sets,omitempty"`
 	TotalReps         int           `json:"total_reps,omitempty"`
 	Exercises         []ExerciseOut `json:"exercises,omitempty"`
+	Sensors           []SensorOut   `json:"sensors,omitempty" jsonschema:"external sensors paired during the activity (get_activity only)"`
+	Raw               any           `json:"raw,omitempty" jsonschema:"Garmin's complete, unmodified response for this activity; the fields above are a cleaned-up subset of it"`
+}
+
+// wantRaw reports whether a tool should include raw records: the
+// include_raw_data input defaults to true when the client leaves it out.
+func wantRaw(include *bool) bool { return include == nil || *include }
+
+// rawData returns Garmin's unmodified JSON for an item when include is true,
+// and nil otherwise or when there is none, so that the omitempty field is left
+// out instead of becoming null.
+func rawData(include bool, b json.RawMessage) any {
+	if !include || len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+// SensorOut is an external sensor recorded with an activity. The serial
+// number is deliberately left out: it identifies the device and answers no
+// training question.
+type SensorOut struct {
+	Type            string  `json:"type,omitempty" jsonschema:"what it measures, e.g. HEART_RATE, BIKE_POWER, FOOTPOD"`
+	Manufacturer    string  `json:"manufacturer,omitempty"`
+	Connection      string  `json:"connection,omitempty" jsonschema:"ANTPLUS, BLUETOOTH_LOW_ENERGY, ..."`
+	SoftwareVersion float64 `json:"software_version,omitempty"`
+	BatteryStatus   string  `json:"battery_status,omitempty"`
+	BatteryPercent  *int    `json:"battery_percent,omitempty"`
 }
 
 func metricsOut(o *ActivityOut, m garmin.ActivityMetrics) {
@@ -164,8 +194,8 @@ func metricsOut(o *ActivityOut, m garmin.ActivityMetrics) {
 	o.TotalReps = m.TotalReps
 }
 
-func activityOut(a garmin.Activity) ActivityOut {
-	o := ActivityOut{ID: a.ID, Name: a.Name, Type: a.Type.Key}
+func activityOut(a garmin.Activity, raw bool) ActivityOut {
+	o := ActivityOut{ID: a.ID, Name: a.Name, Type: a.Type.Key, Raw: rawData(raw, a.Raw())}
 	metricsOut(&o, a.ActivityMetrics)
 	if a.HRTimeInZone != ([5]float64{}) {
 		for _, z := range a.HRTimeInZone {
@@ -182,19 +212,20 @@ func activityOut(a garmin.Activity) ActivityOut {
 }
 
 type listActivitiesIn struct {
-	StartDate    string `json:"start_date,omitempty" jsonschema:"earliest local start date, YYYY-MM-DD"`
-	EndDate      string `json:"end_date,omitempty" jsonschema:"latest local start date, YYYY-MM-DD"`
-	Type         string `json:"type,omitempty" jsonschema:"parent activity type: running, cycling, walking, hiking, swimming, fitness_equipment, ..."`
-	SubType      string `json:"sub_type,omitempty" jsonschema:"child activity type: strength_training, trail_running, treadmill_running, road_cycling, ..."`
-	Search       string `json:"search,omitempty" jsonschema:"text to find in activity names and descriptions"`
-	MinDistanceM int64  `json:"min_distance_m,omitempty"`
-	MaxDistanceM int64  `json:"max_distance_m,omitempty"`
-	MinDurationS int64  `json:"min_duration_s,omitempty"`
-	MaxDurationS int64  `json:"max_duration_s,omitempty"`
-	SortBy       string `json:"sort_by,omitempty" jsonschema:"name, distance or duration. Defaults to start time."`
-	Ascending    bool   `json:"ascending,omitempty" jsonschema:"oldest or smallest first. Default is newest first."`
-	Limit        int    `json:"limit,omitempty" jsonschema:"activities to return, 1 to 100. Default 20."`
-	Offset       int    `json:"offset,omitempty" jsonschema:"activities to skip, for paging"`
+	StartDate      string `json:"start_date,omitempty" jsonschema:"earliest local start date, YYYY-MM-DD"`
+	EndDate        string `json:"end_date,omitempty" jsonschema:"latest local start date, YYYY-MM-DD"`
+	Type           string `json:"type,omitempty" jsonschema:"parent activity type: running, cycling, walking, hiking, swimming, fitness_equipment, ..."`
+	SubType        string `json:"sub_type,omitempty" jsonschema:"child activity type: strength_training, trail_running, treadmill_running, road_cycling, ..."`
+	Search         string `json:"search,omitempty" jsonschema:"text to find in activity names and descriptions"`
+	MinDistanceM   int64  `json:"min_distance_m,omitempty"`
+	MaxDistanceM   int64  `json:"max_distance_m,omitempty"`
+	MinDurationS   int64  `json:"min_duration_s,omitempty"`
+	MaxDurationS   int64  `json:"max_duration_s,omitempty"`
+	SortBy         string `json:"sort_by,omitempty" jsonschema:"name, distance or duration. Defaults to start time."`
+	Ascending      bool   `json:"ascending,omitempty" jsonschema:"oldest or smallest first. Default is newest first."`
+	Limit          int    `json:"limit,omitempty" jsonschema:"activities to return, 1 to 100. Default 20."`
+	Offset         int    `json:"offset,omitempty" jsonschema:"activities to skip, for paging"`
+	IncludeRawData *bool  `json:"include_raw_data,omitempty" jsonschema:"also return Garmin's complete, unmodified record for each item under raw. Default true. Set false for long ranges: the raw records make the output several times larger."`
 }
 
 type listActivitiesOut struct {
@@ -204,7 +235,8 @@ type listActivitiesOut struct {
 }
 
 type activityIDIn struct {
-	ActivityID int64 `json:"activity_id" jsonschema:"activity id from list_activities"`
+	ActivityID     int64 `json:"activity_id" jsonschema:"activity id from list_activities"`
+	IncludeRawData *bool `json:"include_raw_data,omitempty" jsonschema:"also return Garmin's complete, unmodified record for each item under raw. Default true. Set false for long ranges: the raw records make the output several times larger."`
 }
 
 type splitsIn struct {
@@ -268,7 +300,7 @@ func (s *Server) registerActivityTools() {
 		s.listActivities)
 
 	addTool(s, "get_activity", "Get one activity",
-		"Summary of a single activity by id: type, time zone, distance, duration, heart rate, elevation, training effect.",
+		"Summary of a single activity by id: type, time zone, distance, duration, heart rate, elevation, training effect, and the external sensors used (heart-rate strap, power meter, foot pod; with battery state).",
 		s.getActivity)
 
 	addTool(s, "get_activity_splits", "Get activity splits",
@@ -282,6 +314,7 @@ func (s *Server) registerActivityTools() {
 
 // listActivities handles the list_activities tool.
 func (s *Server) listActivities(ctx context.Context, in listActivitiesIn) (listActivitiesOut, error) {
+	raw := wantRaw(in.IncludeRawData)
 	limit := in.Limit
 	switch {
 	case limit == 0:
@@ -311,7 +344,7 @@ func (s *Server) listActivities(ctx context.Context, in listActivitiesIn) (listA
 	}
 	out := listActivitiesOut{Count: len(acts), Activities: make([]ActivityOut, 0, len(acts))}
 	for _, a := range acts {
-		out.Activities = append(out.Activities, activityOut(a))
+		out.Activities = append(out.Activities, activityOut(a, raw))
 	}
 	if len(acts) == limit {
 		out.NextOffset = ptr(in.Offset + len(acts))
@@ -321,12 +354,19 @@ func (s *Server) listActivities(ctx context.Context, in listActivitiesIn) (listA
 
 // getActivity handles the get_activity tool.
 func (s *Server) getActivity(ctx context.Context, in activityIDIn) (ActivityOut, error) {
+	raw := wantRaw(in.IncludeRawData)
 	d, err := s.api.ActivityDetail(ctx, in.ActivityID)
 	if err != nil {
 		return ActivityOut{}, err
 	}
-	o := ActivityOut{ID: d.ID, Name: d.Name, Type: d.Type.Key, TimeZone: d.TimeZone}
+	o := ActivityOut{ID: d.ID, Name: d.Name, Type: d.Type.Key, TimeZone: d.TimeZone, Raw: rawData(raw, d.Raw())}
 	metricsOut(&o, d.Summary)
+	for _, sn := range d.Sensors {
+		o.Sensors = append(o.Sensors, SensorOut{
+			Type: sn.DeviceType, Manufacturer: sn.Manufacturer, Connection: sn.SourceType,
+			SoftwareVersion: sn.SoftwareVersion, BatteryStatus: sn.BatteryStatus, BatteryPercent: sn.BatteryLevel,
+		})
+	}
 	return o, nil
 }
 
