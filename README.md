@@ -1,31 +1,141 @@
 # garmin-training
 
-A Go client for the **Garmin Connect Personal API** (your own data, pull-based, no
-developer-program approval), and an **MCP server** that lets AI agents read it.
+Let an AI assistant such as Claude read your Garmin Connect data, so you can ask it about
+your training, sleep and recovery in plain language:
 
-- `garmin-connect/` is an importable library, `github.com/dianabarsan/garmin-training/garmin-connect`
-  (package `garminconnect`), with its token handling in `garmin-connect/auth`. It depends on
-  the standard library only.
-- `cmd/garmin-mcp/` is the MCP server: the `main` package handles configuration, logging,
-  listening and shutdown, and `internal/mcpserver` holds the tools and HTTP routes. It is the only place that uses a
-  third-party module (the official MCP Go SDK).
+- "How did I sleep this week, and how does it compare with last week?"
+- "Show my last five runs with pace and heart rate, and my per-km splits for the longest."
+- "Has my resting heart rate or HRV changed since I started this training block?"
+- "Summarise my strength sessions this month, exercise by exercise."
+
+It is a small server that you run yourself, on your own computer or on a host you
+control. It uses the **Garmin Connect Personal API**, which gives you access to your own
+data, and speaks the **Model Context Protocol (MCP)**, the standard way AI assistants
+connect to outside tools.
+
+## How it works
+
+```
+ Claude (or another MCP client)  ──asks──▶  this server  ──fetches──▶  Garmin Connect
+                                 ◀─answer─              ◀───────────
+```
+
+1. You create a personal API key in your Garmin account and give it to the server.
+2. You add the server to your AI assistant as a connector.
+3. When you ask a question, the assistant calls one of the server's tools, for example
+   "get sleep for these dates". The server fetches that data from Garmin and hands it back.
+
+The server is **read-only**: it cannot change anything in your Garmin account. It keeps
+nothing between requests except, if you ask it to, your key. The key itself is never shown
+to the assistant, never logged, and never sent anywhere but Garmin.
 
 The Personal API is for one person's own data. Garmin's terms do not allow it in
-commercial multi-user applications.
+commercial multi-user applications, so each person runs their own copy with their own key.
 
-## Get an API key
+## What you need
 
-Create a key at <https://connect.garmin.com/app/settings/personalApiToken>. It is
-shown once and expires after the period you choose (30 days to a year). The key is
-exchanged for a 24-hour access token, which this project renews automatically.
+- **A Garmin Personal API key.** Create one at
+  <https://connect.garmin.com/app/settings/personalApiToken>. It is shown once and expires
+  after the period you choose (30 days to a year). The server exchanges it for a 24-hour
+  access token and renews that automatically, so you only deal with the key itself.
+- **Somewhere to run the server** (see below).
+- **An MCP client**, such as Claude Code, or claude.ai and the Claude apps through a custom
+  connector.
 
-## The MCP server
+## Choose where to run it
+
+| Option | Good for | Guide |
+|---|---|---|
+| **Your own computer** | Trying it out, or using it with Claude Code on the same machine. Needs Go, or Docker. | [`docs/running-locally.md`](docs/running-locally.md) |
+| **Fly.io** | Using it from claude.ai or your phone, whether or not your computer is on. No domain needed; about $2 a month. | [`docs/fly.md`](docs/fly.md) |
+| **Your own server** | The same, on a server you already have, with Docker Compose and automatic HTTPS. | [`deploy/README.md`](deploy/README.md) |
+
+### Quick start on your computer
+
+With [Go](https://go.dev/dl/) installed, from a copy of this repository:
 
 ```sh
 go run ./cmd/garmin-mcp          # listens on http://127.0.0.1:8808
 ```
 
-Then provide your key in any of these ways:
+Open <http://127.0.0.1:8808/> and paste your key. Then connect Claude Code:
+
+```sh
+claude mcp add --transport http garmin http://127.0.0.1:8808/mcp
+```
+
+and ask it something like "how did I sleep this week?". Other MCP clients connect to
+`http://127.0.0.1:8808/mcp` (streamable HTTP).
+
+This only listens on your own machine. To keep your key between restarts, run it in the
+background, or reach it from claude.ai or your phone, follow one of the guides above.
+
+## What your assistant can see
+
+All tools are read-only. Dates are your local calendar dates (`YYYY-MM-DD`); tools that
+take a date range default to the last 7 days ending today and accept up to 366 days.
+
+| Tool | What it returns |
+|---|---|
+| `auth_status` | Whether a key has been provided. |
+| `list_activities` | Activities with distance, duration, heart rate, elevation, training effect, HR-zone time and, for strength sessions, the per-exercise breakdown. Filters: dates, type, sub-type, text, distance/duration, sort, paging. |
+| `get_activity` | One activity's summary. |
+| `get_activity_splits` | Per-km (or per-mile) splits computed from the per-second data. |
+| `get_activity_series` | Heart rate, speed, elevation, cadence, power over time (GPS is never included), thinned to `max_points`. |
+| `get_daily_summaries` | Steps, calories, heart rate, stress, Body Battery, intensity minutes, respiration, SpO2, hydration. |
+| `get_sleep` | Sleep stages, score, heart rate, SpO2, sleep need, naps. |
+| `get_heart_rate` | Resting/min/max for a day, optionally the curve in buckets. |
+| `get_hrv` | Nightly HRV, weekly average, status and baseline. |
+| `get_body_battery`, `get_stress`, `get_steps` | Daily series. |
+| `get_vo2max` | VO2 max history. |
+| `get_heart_rate_zones` | Zones as bpm ranges for a sport. |
+
+Garmin does not offer laps or individual strength sets through the Personal API, so the
+server cannot provide them either.
+
+If a tool is called before a key is provided, it returns an error telling the assistant to
+ask you for the key. An assistant cannot provide the key itself.
+
+### Raw data, location and size
+
+Besides the cleaned-up fields above, every item a tool returns carries Garmin's complete,
+unmodified record under `raw`: every field Garmin sent, including those the curated fields
+leave out (for example an activity's sensors, lap count or running dynamics). Every tool
+that returns it takes `include_raw_data` (default `true`); set it to `false` to get only the
+cleaned-up fields. `get_activity_splits` and `get_activity_series` have no raw data: they
+are computed from the per-second data, which is several megabytes per activity and holds
+the full GPS track, so it is not passed through. Two consequences of the default:
+
+- **Location.** Activity records include the start and end coordinates
+  (`startLatitude`, `startLongitude`, `endLatitude`, `endLongitude`) and `locationName`. For
+  runs that start at home, that is your home address, and it becomes part of the
+  conversation.
+- **Size.** Outputs are several times larger. Measured on a real account: 7 days of sleep
+  about 50 KB, 7 days of daily summaries about 53 KB, 10 activities about 39 KB, and a
+  year of sleep about 1.25 MB, which is more than an assistant can take in at once. For long
+  ranges, ask for shorter ones or for `include_raw_data: false`.
+
+## Privacy and security
+
+The server exposes your health data and holds your Garmin key, so it is locked down by
+default:
+
+- Out of the box it only listens on your own machine and **refuses to start on any other
+  address unless you set an access token**, which every client must then send.
+- When it is reachable from outside, you can remove the key-entry page altogether
+  (`-disable-auth-endpoint`), so even someone holding the token cannot swap in a different
+  key. The hosting guides set this up for you.
+- The key is never returned by any endpoint or tool, never logged, and never part of an
+  error message. Tests check this on every path.
+- An **audit log** records every tool call and every refused request (what was asked for,
+  by which client, and when), never the data returned. If a token ever leaks, it tells you
+  what was read. See [Audit log](#audit-log).
+
+The full details are under [Security model](#security-model).
+
+## Reference
+
+### Providing the key
 
 | How | Command |
 |---|---|
@@ -33,13 +143,8 @@ Then provide your key in any of these ways:
 | HTTP endpoint | `printf '{"api_key":"%s"}' "$KEY" \| curl -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/auth` |
 | Environment | `GARMIN_PERSONAL_API_KEY=... go run ./cmd/garmin-mcp` |
 
-Point your MCP client at `http://127.0.0.1:8808/mcp` (streamable HTTP).
-
-More ways to run it on your own machine (install as a command, a background service,
-Docker, trying it from claude.ai through a tunnel) are in
-[`docs/running-locally.md`](docs/running-locally.md). To host it always-on for your phone,
-see [`docs/fly.md`](docs/fly.md) (Fly.io, no domain needed) or
-[`deploy/README.md`](deploy/README.md) (your own server with Caddy).
+The key stays in memory. To survive restarts, pass `-key-store path` (a file created
+with mode `0600` in a `0700` directory); `DELETE /auth` removes it.
 
 ### The `/auth` endpoint
 
@@ -48,9 +153,6 @@ see [`docs/fly.md`](docs/fly.md) (Fly.io, no domain needed) or
 | `POST /auth` `{"api_key": "..."}` (JSON, or the form on `/`) | Checks the key with Garmin; if accepted it becomes the active key. A rejected key changes nothing. `401` means Garmin refused it. |
 | `GET /auth` | `{"authenticated": bool, "token_expires_at": ..., "persisted": bool}`. Never returns the key. |
 | `DELETE /auth` | Forgets the key (and deletes the stored copy, if any). |
-
-The key stays in memory. To survive restarts, pass `-key-store path` (a file created
-with mode `0600` in a `0700` directory); `DELETE /auth` removes it.
 
 ### Flags
 
@@ -70,8 +172,7 @@ with mode `0600` in a `0700` directory); `DELETE /auth` removes it.
 
 ### Security model
 
-This server exposes your health data and accepts your Garmin key, so by default it is
-built for a single user on one machine:
+By default the server is built for a single user on one machine:
 
 - It binds to **loopback** and rejects requests whose `Host` header is not
   `localhost`, `127.0.0.1` or `::1` (DNS-rebinding defence), except `/healthz`, which only answers `ok`.
@@ -85,9 +186,8 @@ built for a single user on one machine:
 - The key is never returned by any endpoint or tool, never logged, and never part of an
   error message. Tests check this on every path.
 - If you expose it beyond localhost, put it behind TLS (a reverse proxy); the server
-  speaks plain HTTP. **[`deploy/`](deploy/README.md) has a ready-to-run setup** (Docker
-  Compose with Caddy and automatic HTTPS, exposing only `/mcp`) for reaching it from your
-  phone.
+  speaks plain HTTP. [`docs/fly.md`](docs/fly.md) and [`deploy/README.md`](deploy/README.md)
+  both give you HTTPS.
 
 ### Audit log
 
@@ -130,48 +230,18 @@ calls without exposing an identifier that could be replayed.
   record.
 - `client_connected` is only emitted for HTTP clients, which is how real clients connect.
 
-### Tools
+## For developers
 
-All tools are read-only. Dates are your local calendar dates (`YYYY-MM-DD`); range tools
-default to the last 7 days ending today and accept up to 366 days.
+The repository has two parts:
 
-| Tool | What it returns |
-|---|---|
-| `auth_status` | Whether a key has been provided. |
-| `list_activities` | Activities with distance, duration, heart rate, elevation, training effect, HR-zone time and, for strength sessions, the per-exercise breakdown. Filters: dates, type, sub-type, text, distance/duration, sort, paging. |
-| `get_activity` | One activity's summary. |
-| `get_activity_splits` | Per-km (or per-mile) splits computed from the per-second data. |
-| `get_activity_series` | Heart rate, speed, elevation, cadence, power over time (GPS is never included), thinned to `max_points`. |
-| `get_daily_summaries` | Steps, calories, heart rate, stress, Body Battery, intensity minutes, respiration, SpO2, hydration. |
-| `get_sleep` | Sleep stages, score, heart rate, SpO2, sleep need, naps. |
-| `get_heart_rate` | Resting/min/max for a day, optionally the curve in buckets. |
-| `get_hrv` | Nightly HRV, weekly average, status and baseline. |
-| `get_body_battery`, `get_stress`, `get_steps` | Daily series. |
-| `get_vo2max` | VO2 max history. |
-| `get_heart_rate_zones` | Zones as bpm ranges for a sport. |
+- `garmin-connect/` is an importable Go library for the Personal API,
+  `github.com/dianabarsan/garmin-training/garmin-connect` (package `garminconnect`), with its
+  token handling in `garmin-connect/auth`. It depends on the standard library only.
+- `cmd/garmin-mcp/` is the MCP server: the `main` package handles configuration, logging,
+  listening and shutdown, and `internal/mcpserver` holds the tools and HTTP routes. It is
+  the only place that uses a third-party module (the official MCP Go SDK).
 
-**Raw data.** Besides the cleaned-up fields above, every item a tool returns carries
-Garmin's complete, unmodified record under `raw`: every field Garmin sent, including those
-the curated fields leave out (for example an activity's sensors, lap count or running
-dynamics). Every tool that returns it takes `include_raw_data` (default `true`); set it to
-`false` to get only the cleaned-up fields. `get_activity_splits` and `get_activity_series`
-have no raw data: they are computed from the per-second data, which is several megabytes
-per activity and holds the full GPS track, so it is not passed through. Two consequences
-of the default:
-
-- **Location.** Activity records include the start and end coordinates
-  (`startLatitude`, `startLongitude`, `endLatitude`, `endLongitude`) and `locationName`. For
-  runs that start at home, that is your home address, and it becomes part of the
-  conversation.
-- **Size.** Outputs are several times larger. Measured on a real account: 7 days of sleep
-  about 50 KB, 7 days of daily summaries about 53 KB, 10 activities about 39 KB, and a
-  year of sleep about 1.25 MB, which is more than an agent can take in at once. For long
-  ranges, ask for shorter ones or for `include_raw_data: false`.
-
-If a tool is called before a key is provided, it returns an error telling the agent to
-ask you for the key; an agent cannot provide it itself.
-
-## The library
+### Using the library
 
 ```go
 import (
@@ -191,9 +261,9 @@ It covers activities (list, paging, filters, detail, FIT download, per-second se
 splits, strength breakdown), daily summaries, steps, stress, sleep, heart rate, HRV,
 Body Battery, VO2 max and heart-rate zones. Long date ranges are split automatically to
 fit Garmin's per-endpoint caps, and HTTP 204 ("no data") is an empty result, not an
-error. Garmin publishes no laps or per-set strength data for the Personal API.
+error.
 
-## Development
+### Development
 
 ```sh
 go vet ./... && go test -race -cover ./...
