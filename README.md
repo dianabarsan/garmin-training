@@ -1,79 +1,92 @@
 # garmin-training
 
-Let an AI assistant such as Claude read your Garmin Connect data, so you can ask it about
-your training, sleep and recovery in plain language:
+An MCP server that gives AI assistants read-only access to your Garmin Connect data through
+the Garmin Connect Personal API. Connected to Claude or any other Model Context Protocol
+client, it lets you query training, sleep and recovery data in natural language, for
+example:
 
-- "How did I sleep this week, and how does it compare with last week?"
-- "Show my last five runs with pace and heart rate, and my per-km splits for the longest."
+- "Compare my sleep this week with last week."
+- "List my last five runs with pace and heart rate, and the per-km splits of the longest."
 - "Has my resting heart rate or HRV changed since I started this training block?"
-- "Summarise my strength sessions this month, exercise by exercise."
+- "Summarise this month's strength sessions by exercise."
 
-It is a small server that you run yourself, on your own computer or on a host you
-control. It uses the **Garmin Connect Personal API**, which gives you access to your own
-data, and speaks the **Model Context Protocol (MCP)**, the standard way AI assistants
-connect to outside tools.
+The server is self-hosted: each user runs their own instance with their own API key.
 
 ## How it works
 
 ```
- Claude (or another MCP client)  ──asks──▶  this server  ──fetches──▶  Garmin Connect
-                                 ◀─answer─              ◀───────────
+ MCP client (e.g. Claude)  ── tool call ──▶  garmin-mcp  ── API request ──▶  Garmin Connect
+                           ◀─── result ────              ◀──── data ───────
 ```
 
-1. You create a personal API key in your Garmin account and give it to the server.
-2. You add the server to your AI assistant as a connector.
-3. When you ask a question, the assistant calls one of the server's tools, for example
-   "get sleep for these dates". The server fetches that data from Garmin and hands it back.
+1. Generate a Personal API key in Garmin Connect and provide it to the server.
+2. Register the server as a connector in your MCP client.
+3. The assistant calls the server's tools as needed, for example to retrieve sleep data for
+   a date range. The server fetches the data from Garmin and returns it.
 
-The server is **read-only**: it cannot change anything in your Garmin account. It keeps
-nothing between requests except, if you ask it to, your key. The key itself is never shown
-to the assistant, never logged, and never sent anywhere but Garmin.
+The server is **read-only** and cannot modify your Garmin account. It does not store your
+Garmin data; it persists only the API key and, when enabled, an audit log of requests
+(never the data returned). The key is
+never exposed to the assistant, never logged, and sent only to Garmin.
 
-The Personal API is for one person's own data. Garmin's terms do not allow it in
-commercial multi-user applications, so each person runs their own copy with their own key.
+The Personal API covers an individual's own data. Garmin's terms prohibit its use in
+commercial multi-user applications.
 
-## What you need
+## Requirements
 
-- **A Garmin Personal API key.** Create one at
-  <https://connect.garmin.com/app/settings/personalApiToken>. It is shown once and expires
-  after the period you choose (30 days to a year). The server exchanges it for a 24-hour
-  access token and renews that automatically, so you only deal with the key itself.
-- **Somewhere to run the server** (see below).
-- **An MCP client**, such as Claude Code, or claude.ai and the Claude apps through a custom
+- **A Garmin Personal API key**, created at
+  <https://connect.garmin.com/app/settings/personalApiToken>. The key is displayed once and
+  is valid for a period you choose (30 days to one year). The server exchanges it for
+  24-hour access tokens and renews them automatically.
+- **An MCP client**, such as Claude Code, or claude.ai and the Claude apps via a custom
   connector.
+- **A host for the server.** See [Deployment options](#deployment-options).
 
-## Choose where to run it
+## Deployment options
 
-| Option | Good for | Guide |
+| Setup | Use case | Guide |
 |---|---|---|
-| **Your own computer** | Trying it out, or using it with Claude Code on the same machine. Needs Go, or Docker. | [`docs/running-locally.md`](docs/running-locally.md) |
-| **Fly.io** | Using it from claude.ai or your phone, whether or not your computer is on. No domain needed; about $2 a month. | [`docs/fly.md`](docs/fly.md) |
-| **Your own server** | The same, on a server you already have, with Docker Compose and automatic HTTPS. | [`deploy/README.md`](deploy/README.md) |
+| **Local** | Evaluation, or use with Claude Code on the same machine. | [Local setup](#local-setup); [`docs/running-locally.md`](docs/running-locally.md) for running without Docker |
+| **Fly.io** | Always-on access from claude.ai and the mobile apps, with no domain required. Approximately $2 per month. | [`docs/fly.md`](docs/fly.md) |
+| **Self-hosted server** | Always-on access on existing infrastructure, using Docker Compose with Caddy for automatic HTTPS. | [`deploy/README.md`](deploy/README.md) |
 
-### Quick start on your computer
+## Local setup
 
-With [Go](https://go.dev/dl/) installed, from a copy of this repository:
-
-```sh
-go run ./cmd/garmin-mcp          # listens on http://127.0.0.1:8808
-```
-
-Open <http://127.0.0.1:8808/> and paste your key. Then connect Claude Code:
+Prerequisites: [Docker](https://docs.docker.com/get-docker/), git, curl and bash (macOS,
+Linux, or WSL on Windows). The `jq` example below additionally needs
+[jq](https://jqlang.org/download/).
 
 ```sh
-claude mcp add --transport http garmin http://127.0.0.1:8808/mcp
+git clone https://github.com/dianabarsan/garmin-training.git
+cd garmin-training
+./setup.sh
 ```
 
-and ask it something like "how did I sleep this week?". Other MCP clients connect to
-`http://127.0.0.1:8808/mcp` (streamable HTTP).
+The script builds the image, starts the server, prompts for your Garmin API key (input is
+hidden) and validates it with Garmin. If Claude Code is installed, it offers to register
+the connector; otherwise it prints the command to do so.
 
-This only listens on your own machine. To keep your key between restarts, run it in the
-background, or reach it from claude.ai or your phone, follow one of the guides above.
+Resulting configuration:
 
-## What your assistant can see
+- The server listens on `http://127.0.0.1:8808/mcp`, is reachable only from the local
+  machine, and restarts automatically with Docker.
+- Clients authenticate with a bearer token, generated by the script and stored in
+  `~/.config/garmin-mcp/token`. To connect another MCP client, use the URL above with the
+  header `Authorization: Bearer <token>`.
+- The API key and the [audit log](#audit-log) are stored in a Docker volume and persist
+  across restarts and updates.
 
-All tools are read-only. Dates are your local calendar dates (`YYYY-MM-DD`); tools that
-take a date range default to the last 7 days ending today and accept up to 366 days.
+| Task | Command |
+|---|---|
+| Update | `git pull && ./setup.sh` |
+| Replace an expired key | `./setup.sh --new-key` |
+| View the audit log | `./setup.sh --audit-log` (JSON lines; for example `./setup.sh --audit-log \| jq -c 'select(.msg=="access_denied")'`) |
+| Uninstall | `./setup.sh --uninstall` |
+
+## Available tools
+
+All tools are read-only. Dates are local calendar dates (`YYYY-MM-DD`); range tools default
+to the last 7 days and accept ranges of up to 366 days.
 
 | Tool | What it returns |
 |---|---|
@@ -90,48 +103,48 @@ take a date range default to the last 7 days ending today and accept up to 366 d
 | `get_vo2max` | VO2 max history. |
 | `get_heart_rate_zones` | Zones as bpm ranges for a sport. |
 
-Garmin does not offer laps or individual strength sets through the Personal API, so the
-server cannot provide them either.
+Laps and individual strength sets are not available through the Personal API.
 
-If a tool is called before a key is provided, it returns an error telling the assistant to
-ask you for the key. An assistant cannot provide the key itself.
+If a tool is called before an API key has been provided, it returns an error instructing
+the assistant to request one from the user; the assistant cannot supply the key itself.
 
-### Raw data, location and size
+### Raw data, location and response size
 
-Besides the cleaned-up fields above, every item a tool returns carries Garmin's complete,
-unmodified record under `raw`: every field Garmin sent, including those the curated fields
-leave out (for example an activity's sensors, lap count or running dynamics). Every tool
-that returns it takes `include_raw_data` (default `true`); set it to `false` to get only the
-cleaned-up fields. `get_activity_splits` and `get_activity_series` have no raw data: they
-are computed from the per-second data, which is several megabytes per activity and holds
-the full GPS track, so it is not passed through. Two consequences of the default:
+In addition to the normalised fields above, each item includes Garmin's complete,
+unmodified record under `raw`, with fields the normalised output omits (for example an
+activity's sensors, lap count or running dynamics). Tools that return raw data accept
+`include_raw_data` (default `true`); set it to `false` to return only the normalised
+fields. `get_activity_splits` and `get_activity_series` do not include raw data: they are
+derived from per-second data, which runs to several megabytes per activity and contains
+the full GPS track.
 
-- **Location.** Activity records include the start and end coordinates
-  (`startLatitude`, `startLongitude`, `endLatitude`, `endLongitude`) and `locationName`. For
-  runs that start at home, that is your home address, and it becomes part of the
-  conversation.
-- **Size.** Outputs are several times larger. Measured on a real account: 7 days of sleep
-  about 50 KB, 7 days of daily summaries about 53 KB, 10 activities about 39 KB, and a
-  year of sleep about 1.25 MB, which is more than an assistant can take in at once. For long
-  ranges, ask for shorter ones or for `include_raw_data: false`.
+With raw data enabled:
+
+- **Location.** Activity records include start and end coordinates (`startLatitude`,
+  `startLongitude`, `endLatitude`, `endLongitude`) and `locationName`. For activities that
+  start at home, this discloses your home location to the assistant.
+- **Response size.** Responses are several times larger. Measured on a real account:
+  7 days of sleep ≈ 50 KB, 7 days of daily summaries ≈ 53 KB, 10 activities ≈ 39 KB, one
+  year of sleep ≈ 1.25 MB, which exceeds what an assistant can process at once. For long
+  ranges, request shorter periods or set `include_raw_data: false`.
 
 ## Privacy and security
 
-The server exposes your health data and holds your Garmin key, so it is locked down by
-default:
+The server handles health data and a Garmin credential, and is restrictive by default:
 
-- Out of the box it only listens on your own machine and **refuses to start on any other
-  address unless you set an access token**, which every client must then send.
-- When it is reachable from outside, you can remove the key-entry page altogether
-  (`-disable-auth-endpoint`), so even someone holding the token cannot swap in a different
-  key. The hosting guides set this up for you.
-- The key is never returned by any endpoint or tool, never logged, and never part of an
-  error message. Tests check this on every path.
-- An **audit log** records every tool call and every refused request (what was asked for,
-  by which client, and when), never the data returned. If a token ever leaks, it tells you
-  what was read. See [Audit log](#audit-log).
+- It binds to loopback and **refuses to start on any other address unless an access token
+  is configured**; every client must then present the token.
+- For deployments reachable from other machines, `-disable-auth-endpoint` removes the
+  key-entry endpoint entirely, so a leaked token cannot be used to replace the key. The
+  Fly.io guide enables it; in the self-hosted setup the endpoint is hidden from the
+  internet by Caddy, and the guide describes how to remove it entirely.
+- The API key is never returned by any endpoint or tool, never logged, and never included
+  in error messages. Tests enforce this on every code path.
+- An **audit log** records every tool call and refused request (operation, client and time)
+  but never the returned data, so access can be reconstructed if a token is compromised.
+  See [Audit log](#audit-log).
 
-The full details are under [Security model](#security-model).
+Full details: [Security model](#security-model).
 
 ## Reference
 
@@ -209,6 +222,17 @@ grep audit=true server.log                                       # the normal lo
 jq -c 'select(.msg=="access_denied")' audit.log                  # who was refused
 jq -c 'select(.msg=="tool_call") | {time, tool, args, client}' audit.log
 ```
+
+**Where to find it:**
+
+| Setup | Location | Command |
+|---|---|---|
+| Local, [`setup.sh`](#local-setup) | `/data/audit.log` in the Docker volume (JSON lines) | `./setup.sh --audit-log` |
+| Local, `go run` or installed command | The server's standard error, or the file passed to `-audit-log` | Read the terminal output, or `jq -c . <file>` |
+| Local, systemd ([guide](docs/running-locally.md), section 5) | The user journal, or the file passed to `-audit-log` | `journalctl --user -u garmin-mcp \| grep audit=true` |
+| Local, manual `docker run` ([guide](docs/running-locally.md), section 6) | The container log; cleared when the container is removed | `docker logs garmin-mcp 2>&1 \| grep audit=true` |
+| Fly.io ([guide](docs/fly.md)) | Fly's log stream; only a recent window is available | `fly logs -a "$APP" --no-tail \| grep audit=true` (omit `--no-tail` to follow live) |
+| Self-hosted server ([guide](deploy/README.md)) | The container log, or a file if configured | `docker compose logs garmin-mcp \| grep audit=true`, run in `deploy/` |
 
 **Never recorded:** the Garmin key, the bearer token (neither the real one nor one a client
 presented), or any data a tool returned. `result_bytes` says how much came back, not what.

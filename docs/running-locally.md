@@ -160,6 +160,16 @@ still has it. Connect Claude Code with
 anyone who can run `docker inspect` on your machine; for a server other people can reach,
 use the Compose setup in `deploy/`, which reads it from a file instead.
 
+Logs, including the audit trail (tagged `audit=true`), are in the container log:
+
+```sh
+docker logs garmin-mcp 2>&1 | grep audit=true
+```
+
+They are cleared when the container is removed. To keep the audit trail across
+containers, add `-e GARMIN_MCP_AUDIT_LOG=/data/audit.log` to `docker run` so it is written
+to the volume, or use `./setup.sh`, which does this for you.
+
 To remove everything: `docker rm -f garmin-mcp && docker volume rm garmin-mcp-data`.
 
 ## 7. Trying claude.ai or your phone against your own machine

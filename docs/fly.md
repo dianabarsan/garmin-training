@@ -171,7 +171,7 @@ to you again (`fly secrets list` shows names only).
 | Garmin key expired (30 days to a year) | Put the new key in a file as `GARMIN_PERSONAL_API_KEY=...` and run `fly secrets import -a "$APP" < thatfile`. The machine restarts. |
 | New token (if it may have leaked) | Same, with a new `GARMIN_MCP_TOKEN=...`; then update the connector's header. |
 | Update the server | `git pull && fly deploy -a "$APP" --ha=false` |
-| Logs and the audit trail | `fly logs -a "$APP"`; filter with `grep audit=true` (see the audit section of the README) |
+| Logs and the audit trail | `fly logs -a "$APP"` follows live; `fly logs -a "$APP" --no-tail` prints recent lines and exits. Filter with `grep audit=true` (see the audit section of the README). Fly keeps only a recent window of logs, so this is not a long-term record. |
 | Status | `fly status -a "$APP"` |
 | Remove everything | `fly apps destroy "$APP"` |
 
