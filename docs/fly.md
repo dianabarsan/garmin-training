@@ -4,7 +4,7 @@ This puts the server on a small machine at Fly.io that wakes on demand, so Claud
 reach it whether or not your computer is on. Fly gives the app an HTTPS address of its own
 (`<app-name>.fly.dev`), so you need neither a domain nor Caddy.
 
-This is the single-user setup: one person, one Garmin key. The server's own `/auth`
+The server serves one person with one Garmin key. Its own `/auth`
 endpoint is switched off, and the key and token reach it as Fly secrets.
 
 ## What has and has not been checked
@@ -193,29 +193,3 @@ only, not CPU or memory.
 - **The whole server is public.** Unlike the Compose setup, where Caddy exposes only `/mcp`,
   Fly forwards every path. That is fine here: `/auth` does not exist, `/mcp` needs the token,
   and `/healthz` reveals nothing.
-
-## Several people on one Fly app (advanced, untested)
-
-Multi-user mode (see "Multiple users" in the README) stores its users in a file, so it needs a
-volume. In `fly.toml`: remove `GARMIN_MCP_DISABLE_AUTH_ENDPOINT`, add
-
-```toml
-[mounts]
-  source = "garmin_data"
-  destination = "/data"
-```
-
-and set `GARMIN_MCP_USERS_FILE=/data/users.json`; create the volume with
-`fly volumes create garmin_data --size 1 --region <region> -a "$APP"`; and replace the two
-single-user secrets with `GARMIN_MCP_ADMIN_TOKEN` and `GARMIN_MCP_MASTER_KEY` (back the master
-key up: without it the stored Garmin keys cannot be read). Caveats, none of which I could test:
-
-- A volume attaches to one machine, so this stays a one-machine app with no failover.
-- Fly's documentation does not say who owns a fresh volume. If it is root, the server (which
-  runs as an unprivileged user) will fail to write `users.json`; tell me and I will add a root
-  variant of the image.
-- `/admin/users` is reachable from the internet, protected only by the admin token. Use a long
-  random one and watch the audit log. To register people without exposing it you would
-  need to run the registration through `fly proxy`, which I have not tried.
-- Registering someone means holding their Garmin key; see the notes on Garmin's terms in the
-  README.

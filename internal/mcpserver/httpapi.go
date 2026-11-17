@@ -33,28 +33,19 @@ func requireToken(token string, audit *slog.Logger, next http.Handler) http.Hand
 	}
 	want := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, ok := bearerToken(r)
+		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
-			auditDenied(audit, r, tokenDenialReason(r)) // never records what was presented
+			reason := "invalid_token"
+			if r.Header.Get("Authorization") == "" {
+				reason = "missing_token"
+			}
+			auditDenied(audit, r, reason) // never records what was presented
 			w.Header().Set("WWW-Authenticate", `Bearer realm="garmin-mcp"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// bearerToken extracts the token from "Authorization: Bearer <token>".
-func bearerToken(r *http.Request) (string, bool) {
-	return strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-}
-
-// tokenDenialReason says why a request's token was refused, for the audit log.
-func tokenDenialReason(r *http.Request) string {
-	if r.Header.Get("Authorization") == "" {
-		return "missing_token"
-	}
-	return "invalid_token"
 }
 
 // hostGuard rejects requests whose Host header is not in allowed. It defends a

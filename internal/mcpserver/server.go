@@ -76,53 +76,13 @@ type Server struct {
 	now          func() time.Time
 	audit        *slog.Logger
 	authEndpoint bool // whether /auth and the key page are served
-	adminManaged bool // multi-user mode: an administrator manages each user's key
 
 	mcp     *mcp.Server
 	handler http.Handler
 }
 
-// coreConfig is what one tool server needs: a Garmin client, its credentials,
-// and how to talk about key problems.
-type coreConfig struct {
-	api          garminAPI
-	creds        *Credentials
-	log, audit   *slog.Logger
-	now          func() time.Time
-	version      string
-	authEndpoint bool
-	adminManaged bool
-}
-
-// newCore builds the MCP server and its tools for one set of credentials,
-// without any HTTP around it. Single-user mode builds one; multi-user mode
-// builds one per registered user.
-func newCore(c coreConfig) *Server {
-	s := &Server{api: c.api, creds: c.creds, log: c.log, now: c.now, audit: c.audit,
-		authEndpoint: c.authEndpoint, adminManaged: c.adminManaged}
-	if s.log == nil {
-		s.log = slog.New(slog.DiscardHandler)
-	}
-	if s.now == nil {
-		s.now = time.Now
-	}
-	if s.audit == nil {
-		s.audit = s.log.With("audit", true)
-	}
-	version := c.version
-	if version == "" {
-		version = "dev"
-	}
-	s.mcp = mcp.NewServer(&mcp.Implementation{Name: "garmin-mcp", Title: "Garmin Connect (personal)", Version: version},
-		&mcp.ServerOptions{Instructions: s.instructions(), InitializedHandler: s.auditConnected})
-	s.mcp.AddReceivingMiddleware(s.auditMiddleware())
-	s.registerTools()
-	return s
-}
-
-// New builds a single-user Server. It refuses a non-loopback Addr without a
-// Token, because the endpoints expose personal health data and accept the Garmin
-// key.
+// New builds a Server. It refuses a non-loopback Addr without a Token, because
+// the endpoints expose personal health data and accept the Garmin key.
 func New(cfg Config) (*Server, error) {
 	if cfg.API == nil || cfg.Credentials == nil {
 		return nil, errors.New("mcpserver: API and Credentials are required")
@@ -130,16 +90,47 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Addr != "" && !IsLoopbackAddr(cfg.Addr) && cfg.Token == "" {
 		return nil, fmt.Errorf("mcpserver: refusing to listen on %q without a token: it is not a loopback address, so anyone who can reach it could read your health data and replace your key", cfg.Addr)
 	}
-	s := newCore(coreConfig{api: cfg.API, creds: cfg.Credentials, log: cfg.Logger, audit: cfg.Audit,
-		now: cfg.Now, version: cfg.Version, authEndpoint: !cfg.DisableAuthEndpoint})
+	s := &Server{api: cfg.API, creds: cfg.Credentials, log: cfg.Logger, now: cfg.Now, authEndpoint: !cfg.DisableAuthEndpoint}
+	if s.log == nil {
+		s.log = slog.New(slog.DiscardHandler)
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	s.audit = cfg.Audit
+	if s.audit == nil {
+		s.audit = s.log.With("audit", true)
+	}
+	version := cfg.Version
+	if version == "" {
+		version = "dev"
+	}
+
+	s.mcp = mcp.NewServer(&mcp.Implementation{Name: "garmin-mcp", Title: "Garmin Connect (personal)", Version: version},
+		&mcp.ServerOptions{Instructions: s.instructions(), InitializedHandler: s.auditConnected})
+	s.mcp.AddReceivingMiddleware(s.auditMiddleware())
+	s.registerTools()
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp },
 		&mcp.StreamableHTTPOptions{SessionTimeout: 30 * time.Minute})
 
-	protect := newCrossOriginProtection(s.audit)
-	hosts, err := allowedHostList(cfg.Addr, cfg.AllowedHosts)
+	protect := http.NewCrossOriginProtection()
+	protect.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auditDenied(s.audit, r, "cross_origin",
+			slog.String("origin", truncate(r.Header.Get("Origin"), maxAuditField)),
+			slog.String("sec_fetch_site", truncate(r.Header.Get("Sec-Fetch-Site"), maxAuditField)))
+		http.Error(w, "cross-origin request refused", http.StatusForbidden)
+	}))
+	allowed, err := normalizeHosts(cfg.AllowedHosts)
 	if err != nil {
 		return nil, err
+	}
+	var hosts []string
+	switch {
+	case len(allowed) > 0:
+		hosts = append(allowed, LoopbackHosts...)
+	case cfg.Addr == "" || IsLoopbackAddr(cfg.Addr):
+		hosts = LoopbackHosts
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", requireToken(cfg.Token, s.audit, protect.Handler(mcpHandler)))
@@ -149,7 +140,10 @@ func New(cfg Config) (*Server, error) {
 			mux.Handle("/", protect.Handler(indexHandler(s.creds)))
 		}
 	}
-	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("ok\n"))
+	})
 	s.handler = hostGuard(hosts, s.audit, mux)
 	return s, nil
 }
@@ -175,9 +169,6 @@ Activities: use list_activities to find an activity id, then get_activity, get_a
 // askUserToProvideKey says what to ask the user to do when no key is set. It
 // depends on whether the server has an endpoint for providing one.
 func (s *Server) askUserToProvideKey() string {
-	if s.adminManaged {
-		return "ask the server's administrator to register or update your Garmin API key"
-	}
 	if s.authEndpoint {
 		return "ask the user to open this server's address in a browser and paste their Garmin Personal API key (or POST it to /auth)"
 	}
@@ -187,9 +178,6 @@ func (s *Server) askUserToProvideKey() string {
 // askUserForNewKey says what to ask the user to do when Garmin rejects the key.
 func (s *Server) askUserForNewKey() string {
 	const create = "ask the user to create a new one at connect.garmin.com/app/settings/personalApiToken and "
-	if s.adminManaged {
-		return create + "give it to the server's administrator to update"
-	}
 	if s.authEndpoint {
 		return create + "provide it at /auth"
 	}
@@ -238,39 +226,4 @@ func normalizeHosts(in []string) ([]string, error) {
 		out = append(out, strings.Trim(h, "[]"))
 	}
 	return out, nil
-}
-
-// newCrossOriginProtection refuses cross-site browser requests that change
-// state, and records each refusal.
-func newCrossOriginProtection(audit *slog.Logger) *http.CrossOriginProtection {
-	protect := http.NewCrossOriginProtection()
-	protect.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auditDenied(audit, r, "cross_origin",
-			slog.String("origin", truncate(r.Header.Get("Origin"), maxAuditField)),
-			slog.String("sec_fetch_site", truncate(r.Header.Get("Sec-Fetch-Site"), maxAuditField)))
-		http.Error(w, "cross-origin request refused", http.StatusForbidden)
-	}))
-	return protect
-}
-
-// allowedHostList is the set of Host header values the server accepts: the
-// configured public names plus localhost names, or just localhost names on a
-// loopback bind, or nil (no check) when bound more widely with no names set.
-func allowedHostList(addr string, allowedHosts []string) ([]string, error) {
-	allowed, err := normalizeHosts(allowedHosts)
-	if err != nil {
-		return nil, err
-	}
-	switch {
-	case len(allowed) > 0:
-		return append(allowed, LoopbackHosts...), nil
-	case addr == "" || IsLoopbackAddr(addr):
-		return LoopbackHosts, nil
-	}
-	return nil, nil
-}
-
-func healthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	_, _ = w.Write([]byte("ok\n"))
 }

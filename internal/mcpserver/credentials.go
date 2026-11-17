@@ -107,15 +107,6 @@ func (c *Credentials) Set(ctx context.Context, key string) error {
 	return nil
 }
 
-// Activate makes key the active key without contacting Garmin or saving it
-// anywhere. The caller has already validated it or is restoring one that was.
-func (c *Credentials) Activate(key string) {
-	ts := c.newSource(strings.TrimSpace(key))
-	c.mu.Lock()
-	c.ts = ts
-	c.mu.Unlock()
-}
-
 // LoadStored activates the key from the store without contacting Garmin, so a
 // restart does not need the network. It reports whether a key was found.
 func (c *Credentials) LoadStored() (bool, error) {
