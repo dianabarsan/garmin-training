@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# The server binary, from a plain `go build` in the repository or its directory
+/garmin-mcp
+/cmd/garmin-mcp/garmin-mcp
+
 # Test binary, built with `go test -c`
 *.test
 

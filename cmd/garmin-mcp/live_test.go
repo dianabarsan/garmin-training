@@ -2,8 +2,9 @@
 
 package main
 
-// Live end-to-end check: starts the server, provides the real Garmin key over
-// /auth, connects as an MCP client and calls every tool against the real API.
+// Live end-to-end check: saves the real Garmin key with -set-key, starts the
+// server with it, connects as an MCP client and calls every tool against the
+// real API.
 // Only counts and sanity results are logged, never values.
 //
 //	go test -tags live -run TestLive -v ./cmd/garmin-mcp
@@ -13,7 +14,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +35,17 @@ func TestLiveAllTools(t *testing.T) {
 	}
 	key := strings.TrimSpace(string(keyBytes))
 
-	base, logs, stop := start(t, nil)
+	// 1. Save the key the way setup.sh does: checked with Garmin, then stored.
+	store := filepath.Join(t.TempDir(), "garmin.key")
+	var out syncBuf
+	if err := run(context.Background(), []string{"-set-key", "-key-store", store}, noEnv, strings.NewReader(key), &out, io.Discard, nil); err != nil {
+		t.Fatalf("-set-key: %v", err)
+	}
+	if strings.Contains(out.String(), key) {
+		t.Fatal("-set-key printed the key")
+	}
+
+	base, logs, stop := start(t, nil, "-key-store", store)
 	defer func() { _ = stop() }()
 
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "live", Version: "1"}, nil).
@@ -67,26 +80,7 @@ func TestLiveAllTools(t *testing.T) {
 		return m, true
 	}
 
-	// 1. Before authenticating, a tool must explain what to do.
-	if _, ok := call("get_steps", nil); ok {
-		t.Fatal("get_steps succeeded without a key")
-	}
-	if st, ok := call("auth_status", nil); !ok || st["authenticated"] != false {
-		t.Fatalf("auth_status before: %v", st)
-	}
-
-	// 2. Provide the key through the HTTP endpoint.
-	if code, body := post(t, base+"/auth", `{"api_key":"`+key+`"}`); code != 200 {
-		t.Fatalf("POST /auth: %d %s", code, body)
-	} else if strings.Contains(body, key) {
-		t.Fatal("the /auth response echoed the key")
-	}
-	t.Log("POST /auth accepted the real key")
-	if st, ok := call("auth_status", nil); !ok || st["authenticated"] != true {
-		t.Fatalf("auth_status after: %v", st)
-	}
-
-	// 3. Every data tool.
+	// 2. Every data tool.
 	n := func(m map[string]any, field string) int {
 		if a, ok := m[field].([]any); ok {
 			return len(a)
@@ -159,12 +153,12 @@ func TestLiveAllTools(t *testing.T) {
 		t.Logf("get_heart_rate_zones: sport=%v configured=%v zones=%d", z["sport"], z["configured"], n(z, "zones"))
 	}
 
-	// 4. A year of sleep goes through the range splitting transparently.
+	// 3. A year of sleep goes through the range splitting transparently.
 	if sl, ok := call("get_sleep", map[string]any{"start": "2025-11-16", "end": end}); ok {
 		t.Logf("get_sleep over 365 days: %d entries", n(sl, "days"))
 	}
 
-	// 5. Nothing secret in the server's log.
+	// 4. Nothing secret in the server's log.
 	if strings.Contains(logs.String(), key) {
 		t.Error("the key appears in the server log")
 	}

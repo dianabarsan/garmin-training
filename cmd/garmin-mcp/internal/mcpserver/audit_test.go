@@ -3,10 +3,8 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -54,7 +52,6 @@ func TestAudit_ToolCallsAreRecorded(t *testing.T) {
 	t.Parallel()
 	var ac auditCapture
 	h := newHarness(t, func(c *Config) { c.Audit = ac.logger() })
-	h.authenticate(t)
 	h.fg.route("/usersummary-service/stats/steps/daily/2026-11-01/2026-11-05", `[{"calendarDate":"2026-11-02","totalSteps":1234,"stepGoal":8000,"totalDistance":900}]`)
 	cs := h.connect(t)
 
@@ -83,13 +80,13 @@ func TestAudit_ToolCallsAreRecorded(t *testing.T) {
 	}
 }
 
-func TestAudit_FailuresBeforeAuthenticationAreRecorded(t *testing.T) {
+func TestAudit_RejectedKeyFailuresAreRecorded(t *testing.T) {
 	t.Parallel()
 	var ac auditCapture
-	h := newHarness(t, func(c *Config) { c.Audit = ac.logger() })
+	h := newHarnessWithKey(t, "revoked-key", func(c *Config) { c.Audit = ac.logger() })
 	callTool(t, h.connect(t), "get_sleep", nil)
 	calls := ac.events(t, "tool_call")
-	if len(calls) != 1 || str(calls[0], "outcome") != "error" || !strings.Contains(str(calls[0], "error"), "no Garmin API key") {
+	if len(calls) != 1 || str(calls[0], "outcome") != "error" || !strings.Contains(str(calls[0], "error"), "key was rejected") {
 		t.Errorf("records = %+v", calls)
 	}
 }
@@ -98,7 +95,6 @@ func TestAudit_ArgumentsAreBoundedAndOnOneLine(t *testing.T) {
 	t.Parallel()
 	var ac auditCapture
 	h := newHarness(t, func(c *Config) { c.Audit = ac.logger() })
-	h.authenticate(t)
 	h.fg.route("/activitylist-service/activities/search/activities", `[]`)
 	huge := "line one\nline two\r\n" + strings.Repeat("é", 5000)
 	callTool(t, h.connect(t), "list_activities", map[string]any{"search": huge})
@@ -132,27 +128,17 @@ func TestAudit_NeverContainsSecretsOrData(t *testing.T) {
 	const secretData = "UniqueActivityNameDoNotLog"
 	h := newHarness(t, func(c *Config) { c.Audit = ac.logger(); c.Token = token })
 	base := serveHandler(t, h)
-	bearer := map[string]string{"Authorization": "Bearer " + token}
 
 	h.fg.route("/activitylist-service/activities/search/activities", `[{"activityId":1,"activityName":"`+secretData+`","activityType":{"typeKey":"running"}}]`)
-	do(t, "POST", base+"/auth", "application/json", `{"api_key":"wrong-key-LEAKCHECK"}`, bearer)
-	do(t, "POST", base+"/auth", "application/json", `{"api_key":"`+validKey+`"}`, bearer)
-	do(t, "GET", base+"/auth", "", "", map[string]string{"Authorization": "Bearer " + wrongToken})
-	do(t, "DELETE", base+"/auth", "", "", bearer)
-	h.authenticate(t)
-	hc := &http.Client{Transport: roundTripper(func(r *http.Request) (*http.Response, error) {
-		r = r.Clone(r.Context())
-		r.Header.Set("Authorization", "Bearer "+token)
-		return http.DefaultTransport.RoundTrip(r)
-	})}
-	_ = hc // the MCP path below uses the in-memory session; the HTTP flow above covers the headers
+	do(t, "GET", base+"/mcp", "", "", map[string]string{"Authorization": "Bearer " + wrongToken})
+	do(t, "POST", base+"/mcp", "application/json", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, map[string]string{"Authorization": "Bearer " + token})
 	res := callTool(t, h.connect(t), "list_activities", nil)
 	if !strings.Contains(resultText(res), secretData) {
 		t.Fatalf("test setup: the tool result should contain the data, got %q", resultText(res))
 	}
 
 	got := ac.rec.String()
-	for _, secret := range []string{validKey, "wrong-key-LEAKCHECK", token, wrongToken, "DO-NOT-LOG", secretData} {
+	for _, secret := range []string{validKey, token, wrongToken, "DO-NOT-LOG", secretData} {
 		if strings.Contains(got, secret) {
 			t.Errorf("the audit trail contains %q:\n%s", secret, got)
 		}
@@ -166,7 +152,7 @@ func TestAudit_RefusedRequestsAreRecorded(t *testing.T) {
 	base := serveHandler(t, h)
 
 	do(t, "POST", base+"/mcp", "application/json", `{}`, map[string]string{"User-Agent": "scanner/1.0", "X-Forwarded-For": "203.0.113.9"})
-	do(t, "GET", base+"/auth", "", "", map[string]string{"Authorization": "Bearer nope"})
+	do(t, "GET", base+"/mcp", "", "", map[string]string{"Authorization": "Bearer nope"})
 	do(t, "GET", base+"/mcp", "", "", map[string]string{"Host": "evil.example"})
 
 	denied := ac.events(t, "access_denied")
@@ -182,7 +168,7 @@ func TestAudit_RefusedRequestsAreRecorded(t *testing.T) {
 	if str(missing, "reason") != "missing_token" || str(missing, "path") != "/mcp" || str(missing, "user_agent") != "scanner/1.0" || str(missing, "forwarded_for") != "203.0.113.9" {
 		t.Errorf("missing-token record = %+v", missing)
 	}
-	if str(invalid, "reason") != "invalid_token" || str(invalid, "path") != "/auth" {
+	if str(invalid, "reason") != "invalid_token" || str(invalid, "path") != "/mcp" {
 		t.Errorf("invalid-token record = %+v", invalid)
 	}
 	if str(host, "reason") != "forbidden_host" || str(host, "host") != "evil.example" {
@@ -195,7 +181,7 @@ func TestAudit_CrossOriginRequestsAreRecorded(t *testing.T) {
 	var ac auditCapture
 	h := newHarness(t, func(c *Config) { c.Audit = ac.logger() })
 	base := serveHandler(t, h)
-	code, _, _ := do(t, "POST", base+"/auth", "application/json", `{"api_key":"x"}`, map[string]string{"Origin": "http://evil.example", "Sec-Fetch-Site": "cross-site"})
+	code, _, _ := do(t, "POST", base+"/mcp", "application/json", `{}`, map[string]string{"Origin": "http://evil.example", "Sec-Fetch-Site": "cross-site"})
 	if code != http.StatusForbidden {
 		t.Fatalf("status = %d", code)
 	}
@@ -205,39 +191,9 @@ func TestAudit_CrossOriginRequestsAreRecorded(t *testing.T) {
 	}
 }
 
-func TestAudit_KeyChangesAreRecorded(t *testing.T) {
-	t.Parallel()
-	var ac auditCapture
-	h := newHarness(t, func(c *Config) { c.Audit = ac.logger() })
-	base := serveHandler(t, h)
-
-	do(t, "POST", base+"/auth", "application/json", `{"api_key":"not-the-key"}`, nil)
-	do(t, "POST", base+"/auth", "application/json", `{"api_key":"`+validKey+`"}`, nil)
-	do(t, "POST", base+"/auth", "application/x-www-form-urlencoded", url.Values{"api_key": {validKey}}.Encode(), map[string]string{"X-Forwarded-For": "198.51.100.7"})
-	do(t, "DELETE", base+"/auth", "", "", nil)
-
-	var names []string
-	for _, m := range ac.all(t) {
-		names = append(names, str(m, "msg"))
-		if str(m, "remote") == "" {
-			t.Errorf("key event without a remote address: %+v", m)
-		}
-	}
-	if got, want := strings.Join(names, ","), "key_rejected,key_set,key_set,key_cleared"; got != want {
-		t.Errorf("events = %s, want %s", got, want)
-	}
-	if rejected := ac.events(t, "key_rejected"); str(rejected[0], "level") != "WARN" {
-		t.Errorf("a rejected key is worth a warning: %+v", rejected[0])
-	}
-	if set := ac.events(t, "key_set"); str(set[1], "forwarded_for") != "198.51.100.7" {
-		t.Errorf("forwarded_for = %+v", set[1])
-	}
-}
-
 func TestAudit_WithoutAnAuditLoggerRecordsGoToTheOperationalLogTagged(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t) // no Config.Audit
-	h.authenticate(t)
 	h.fg.route("/usersummary-service/stats/steps/daily/2026-11-10/2026-11-16", `[]`)
 	callTool(t, h.connect(t), "get_steps", nil)
 	log := h.log.String()
@@ -286,8 +242,8 @@ func TestAudit_ClientConnectionsAreRecordedWithAHashedSession(t *testing.T) {
 		return cs
 	}
 	a, b := connect("client-a"), connect("client-b")
-	callTool(t, a, "auth_status", nil)
-	callTool(t, b, "auth_status", nil)
+	callTool(t, a, "get_steps", nil)
+	callTool(t, b, "get_steps", nil)
 
 	// The handshake notification arrives asynchronously.
 	deadline := time.Now().Add(3 * time.Second)
@@ -320,7 +276,7 @@ func TestAudit_NoArgumentsMeansNoArgsField(t *testing.T) {
 	t.Parallel()
 	var ac auditCapture
 	h := newHarness(t, func(c *Config) { c.Audit = ac.logger() })
-	callTool(t, h.connect(t), "auth_status", nil)
+	callTool(t, h.connect(t), "get_steps", nil)
 	calls := ac.events(t, "tool_call")
 	if len(calls) != 1 {
 		t.Fatalf("records = %+v", calls)
@@ -337,7 +293,7 @@ func deniedRequest(addr string) *http.Request {
 	return r
 }
 
-func TestDenyAuditor_ThrottlesEachSource(t *testing.T) {
+func TestDenyAuditor_ThrottlesAllSourcesTogether(t *testing.T) {
 	t.Parallel()
 	var ac auditCapture
 	now := fixedNow
@@ -346,67 +302,31 @@ func TestDenyAuditor_ThrottlesEachSource(t *testing.T) {
 	for range deniedBurst + 5 {
 		d.record(deniedRequest("203.0.113.1:1000"), "invalid_token")
 	}
-	// Another address has its own budget.
+	// Another address shares the budget.
 	d.record(deniedRequest("203.0.113.2:1000"), "invalid_token")
 
-	if n := len(ac.events(t, "access_denied")); n != deniedBurst+1 {
-		t.Errorf("access_denied records = %d, want %d (the burst plus the other address)", n, deniedBurst+1)
+	if n := len(ac.events(t, "access_denied")); n != deniedBurst {
+		t.Errorf("access_denied records = %d, want %d", n, deniedBurst)
 	}
 	thr := ac.events(t, "access_denied_throttled")
 	if len(thr) != 1 || str(thr[0], "remote") != "203.0.113.1:1000" || str(thr[0], "resumes_at") == "" {
 		t.Fatalf("throttled records = %+v", thr)
 	}
 
+	// Within the window nothing more is recorded.
+	now = now.Add(deniedWindow - time.Second)
+	d.record(deniedRequest("203.0.113.3:1000"), "invalid_token")
+	if n := len(ac.events(t, "access_denied")); n != deniedBurst {
+		t.Errorf("a refusal inside the window was recorded")
+	}
+
 	// After the window, recording resumes and reports what was left out.
-	now = now.Add(deniedWindow)
+	now = now.Add(time.Second)
 	d.record(deniedRequest("203.0.113.1:2000"), "invalid_token")
 	all := ac.events(t, "access_denied")
 	last := all[len(all)-1]
-	if got, _ := last["previously_unrecorded"].(float64); got != 5 {
-		t.Errorf("previously_unrecorded = %v, want 5 (%+v)", last["previously_unrecorded"], last)
-	}
-}
-
-func TestDenyAuditor_TracksABoundedNumberOfSources(t *testing.T) {
-	t.Parallel()
-	var ac auditCapture
-	d := newDenyAuditor(ac.logger(), func() time.Time { return fixedNow })
-	for i := range deniedMaxSources + 50 {
-		d.record(deniedRequest(fmt.Sprintf("10.%d.%d.%d:1", i>>16&255, i>>8&255, i&255)), "invalid_token")
-	}
-	if n := len(d.sources); n > deniedMaxSources+1 {
-		t.Errorf("tracked sources = %d, want at most %d", n, deniedMaxSources+1)
-	}
-}
-
-// A full table of throttled addresses must not lock out new addresses
-// forever: once their window ends they are dropped, and what they had left
-// out is reported in one record.
-func TestDenyAuditor_FullTableOfThrottledSourcesIsEvicted(t *testing.T) {
-	t.Parallel()
-	var ac auditCapture
-	now := fixedNow
-	d := newDenyAuditor(ac.logger(), func() time.Time { return now })
-	addr := func(i int) string { return fmt.Sprintf("10.%d.%d.%d:1", i>>16&255, i>>8&255, i&255) }
-	for i := range deniedMaxSources {
-		for range deniedBurst + 2 { // two over budget each
-			d.record(deniedRequest(addr(i)), "invalid_token")
-		}
-	}
-	now = now.Add(deniedWindow)
-	d.record(deniedRequest("203.0.113.9:1"), "invalid_token")
-	if _, shared := d.sources["(other)"]; shared {
-		t.Error("a new address was put in the shared entry although every other entry had expired")
-	}
-	ev := ac.events(t, "access_denied_unrecorded")
-	if len(ev) != 1 {
-		t.Fatalf("unrecorded summaries = %+v", ev)
-	}
-	if n, _ := ev[0]["sources"].(float64); n != deniedMaxSources {
-		t.Errorf("sources = %v, want %d", ev[0]["sources"], deniedMaxSources)
-	}
-	if n, _ := ev[0]["previously_unrecorded"].(float64); n != 2*deniedMaxSources {
-		t.Errorf("previously_unrecorded = %v, want %d", ev[0]["previously_unrecorded"], 2*deniedMaxSources)
+	if got, _ := last["previously_unrecorded"].(float64); got != 7 {
+		t.Errorf("previously_unrecorded = %v, want 7 (%+v)", last["previously_unrecorded"], last)
 	}
 }
 

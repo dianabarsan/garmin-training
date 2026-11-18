@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# One-step setup: builds the server's Docker image, starts it on this machine
-# (http://127.0.0.1:8808), stores your Garmin key, and connects Claude Code.
+# One-step setup: builds the server's Docker image, stores your Garmin key,
+# starts the server on this machine (http://127.0.0.1:8808), and connects
+# Claude Code.
 #
 #   ./setup.sh               set up, or update to the latest code (keeps token and key)
 #   ./setup.sh --new-key     replace the Garmin key (for example after it expired)
@@ -30,7 +31,8 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/garmin-mcp"
 TOKEN_FILE="$CONFIG_DIR/token"
 BASE_URL="http://127.0.0.1:$PORT"
 MCP_URL="$BASE_URL/mcp"
-AUDIT_FILE="/data/audit.log" # inside the volume, next to the key
+KEY_FILE="/data/garmin.key"  # inside the volume; the image's default -key-store
+AUDIT_FILE="/data/audit.log" # next to the key
 KEY_PAGE="https://connect.garmin.com/app/settings/personalApiToken"
 
 say() { printf '==> %s\n' "$*"; }
@@ -97,7 +99,7 @@ other_installs() {
 
 if exists "$CONTAINER" && ! owned "$CONTAINER" && [ "$MODE" != audit-log ]; then
 	die "a container named '$CONTAINER' exists that this script did not create (image '$(docker inspect --type container -f '{{.Config.Image}}' "$CONTAINER")').
-If it is a manual install from docs/running-locally.md, remove it with 'docker rm -f $CONTAINER' and run this script again; if it used the '$VOLUME' volume, the key stored there is reused.
+If it is a container you started yourself, remove it with 'docker rm -f $CONTAINER' and run this script again; if it used the '$VOLUME' volume, the key stored there is reused.
 Otherwise set GARMIN_MCP_CONTAINER and GARMIN_MCP_VOLUME to other names."
 fi
 
@@ -118,11 +120,9 @@ if [ "$MODE" = audit-log ]; then
 	exists "$CONTAINER" || die "no '$CONTAINER' container; run ./setup.sh first"
 	# The image has no shell, so the files are read with `docker cp`, which streams
 	# a tar archive. The server rotates the log to audit.log.1; that one is older.
-	found=0
 	for f in "$AUDIT_FILE.1" "$AUDIT_FILE"; do
-		if docker cp "$CONTAINER:$f" - 2>/dev/null | tar -xO 2>/dev/null; then found=1; fi
-	done
-	[ "$found" = 1 ] || echo "No audit records yet." >&2
+		docker cp "$CONTAINER:$f" - 2>/dev/null | tar -xO 2>/dev/null || true
+	done | awk '{ print } END { if (NR == 0) print "No audit records yet." > "/dev/stderr" }'
 	exit 0
 fi
 
@@ -198,8 +198,53 @@ version="$(git describe --always --dirty 2>/dev/null || echo dev)"
 say "building the image (the first build takes a minute or two)"
 docker build -q -f deploy/Dockerfile --build-arg VERSION="$version" -t "$IMAGE" . >/dev/null
 
-# 4. Replace the container. The old one is stopped and kept aside until the new
-#    one is healthy, and restored if it is not. The key lives in the volume.
+# 4. The Garmin key: asked for only when none is stored, or with --new-key. It
+#    is checked and saved by a one-off run of the image with the volume, so it
+#    never travels over HTTP and is never on a command line.
+keytool() {
+	docker run --rm -i -v "$VOLUME:/data" --read-only --cap-drop ALL --security-opt no-new-privileges \
+		"$IMAGE" -key-store "$KEY_FILE" "$@"
+}
+key_stored() { keytool -key-stored </dev/null >/dev/null 2>&1; }
+set_key() {
+	local key
+	key="$(printf '%s' "$1" | tr -d '[:space:]')"
+	[ -n "$key" ] || { echo "No key entered." >&2; return 1; }
+	# Garmin keys use letters, digits and ._~+/=- only. Anything else is a paste error.
+	case "$key" in
+	*[!A-Za-z0-9._~+/=-]*)
+		echo "That does not look like a Garmin API key (unexpected characters). Paste the whole key exactly as Garmin showed it." >&2
+		return 1
+		;;
+	esac
+	# On failure the tool says why (for example that Garmin rejected the key).
+	printf '%s\n' "$key" | keytool -set-key >/dev/null || return 1
+	say "Garmin accepted the key; it is stored in the '$VOLUME' volume"
+}
+
+if [ "$MODE" = new-key ] || ! key_stored; then
+	if [ -n "${GARMIN_PERSONAL_API_KEY:-}" ]; then
+		set_key "$GARMIN_PERSONAL_API_KEY" || die "the key in GARMIN_PERSONAL_API_KEY was not accepted"
+	elif interactive; then
+		echo "Paste your Garmin Personal API key (create one at $KEY_PAGE)."
+		ok=0
+		for _ in 1 2 3; do
+			printf 'Garmin API key (input hidden): ' >/dev/tty
+			read -rs key </dev/tty || true
+			echo >/dev/tty
+			if set_key "$key"; then ok=1; break; fi
+		done
+		unset key
+		[ "$ok" = 1 ] || die "no key was accepted; run ./setup.sh again when you have one"
+	else
+		die "no Garmin key is stored. Run this in a terminal, or set GARMIN_PERSONAL_API_KEY."
+	fi
+else
+	say "a Garmin key is already stored (use --new-key to replace it)"
+fi
+
+# 5. Replace the container. The old one is stopped and kept aside until the new
+#    one is healthy, and restored if it is not. It reads the key at startup.
 if exists "$PREVIOUS"; then # left over from an interrupted run
 	owned "$PREVIOUS" || die "a container named '$PREVIOUS' exists that this script did not create; remove or rename it"
 	docker rm -f "$PREVIOUS" >/dev/null
@@ -245,73 +290,6 @@ if ! start_new || ! healthy; then
 	die "the new server did not start on $BASE_URL (see the log above)"
 fi
 if [ "$had_old" = 1 ]; then docker rm -f "$PREVIOUS" >/dev/null; fi
-
-# api METHOD PATH [curl args...]: calls the server with the token, which goes
-# through a config file descriptor rather than the command line. Prints the
-# HTTP status; the body is left in $RESP. --noproxy (here and above) keeps the
-# token and these local requests away from any proxy set in http_proxy.
-RESP="$(mktemp)"
-trap 'rm -f "$RESP"' EXIT
-api() {
-	local method="$1" path="$2"
-	shift 2
-	curl -sS --noproxy '*' -o "$RESP" -w '%{http_code}' -X "$method" \
-		-K <(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN") \
-		"$BASE_URL$path" "$@"
-}
-
-authenticated() {
-	[ "$(api GET /auth)" = 200 ] && grep -q '"authenticated":true' "$RESP"
-}
-
-# 5. The Garmin key: asked for only when none is stored, or with --new-key.
-set_key() {
-	local key code
-	key="$(printf '%s' "$1" | tr -d '[:space:]')"
-	[ -n "$key" ] || { echo "No key entered." >&2; return 1; }
-	# Garmin keys use letters, digits and ._~+/=- only, none of which need
-	# escaping in JSON. Anything else is a paste error.
-	case "$key" in
-	*[!A-Za-z0-9._~+/=-]*)
-		echo "That does not look like a Garmin API key (unexpected characters). Paste the whole key exactly as Garmin showed it." >&2
-		return 1
-		;;
-	esac
-	code="$(printf '{"api_key":"%s"}' "$key" | api POST /auth -H 'Content-Type: application/json' --data-binary @-)"
-	case "$code" in
-	200) say "Garmin accepted the key; it is stored in the '$VOLUME' volume" ;;
-	401)
-		if grep -q 'Garmin rejected' "$RESP"; then
-			echo "Garmin rejected that key. Create a new one at $KEY_PAGE" >&2
-		else
-			die "the server refused the access token in $TOKEN_FILE; run ./setup.sh --uninstall, then ./setup.sh"
-		fi
-		return 1
-		;;
-	*) echo "Could not set the key (HTTP $code): $(cat "$RESP")" >&2; return 1 ;;
-	esac
-}
-
-if [ "$MODE" = new-key ] || ! authenticated; then
-	if [ -n "${GARMIN_PERSONAL_API_KEY:-}" ]; then
-		set_key "$GARMIN_PERSONAL_API_KEY" || die "the key in GARMIN_PERSONAL_API_KEY was not accepted"
-	elif interactive; then
-		echo "Paste your Garmin Personal API key (create one at $KEY_PAGE)."
-		ok=0
-		for _ in 1 2 3; do
-			printf 'Garmin API key (input hidden): ' >/dev/tty
-			read -rs key </dev/tty || true
-			echo >/dev/tty
-			if set_key "$key"; then ok=1; break; fi
-		done
-		unset key
-		[ "$ok" = 1 ] || die "no key was accepted; run ./setup.sh again when you have one"
-	else
-		die "no Garmin key is stored. Run this in a terminal, or set GARMIN_PERSONAL_API_KEY."
-	fi
-else
-	say "a Garmin key is already stored (use --new-key to replace it)"
-fi
 
 # 6. Connect Claude Code. `claude mcp add` takes the header as an argument, so
 #    the token is briefly on its command line; Claude Code stores it in its own

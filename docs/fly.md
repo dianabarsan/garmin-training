@@ -4,15 +4,15 @@ This puts the server on a small machine at Fly.io that wakes on demand, so Claud
 reach it whether or not your computer is on. Fly gives the app an HTTPS address of its own
 (`<app-name>.fly.dev`), so you need neither a domain nor Caddy.
 
-The server serves one person with one Garmin key. Its own `/auth`
-endpoint is switched off, and the key and token reach it as Fly secrets.
+The server serves one person with one Garmin key. The key and the token reach it as Fly
+secrets.
 
 ## What has and has not been checked
 
 Checked here, by running the real image the way Fly will (same environment variables, the
 same command override, the secrets as `NAME=VALUE` lines): it starts, accepts the key from
-the environment, answers health checks whatever `Host` header they carry, returns 404 for
-`/auth`, demands the token on `/mcp`, serves real Garmin data, writes nothing to disk, and
+the environment, answers health checks whatever `Host` header they carry, demands the
+token on `/mcp`, serves real Garmin data, writes nothing to disk, and
 stops within 0.2 s of a SIGINT. The `fly.toml` parses as TOML and uses the field names and
 values from Fly's documentation.
 
@@ -68,14 +68,8 @@ cat > fly.toml <<EOF
 app = '$APP'
 primary_region = 'ams'
 
-[experimental]
-  cmd = ['-addr', ':8808']
-
 [build]
   dockerfile = 'deploy/Dockerfile'
-
-[env]
-  GARMIN_MCP_DISABLE_AUTH_ENDPOINT = 'true'
 
 [http_service]
   internal_port = 8808
@@ -108,8 +102,6 @@ seen. Fly's documentation does not say whether `fly launch` rewrites an existing
 | Setting | Why |
 |---|---|
 | `[build] dockerfile = "deploy/Dockerfile"` | builds this project's image |
-| `[experimental] cmd = ["-addr", ":8808"]` | keeps the image from writing your key to disk |
-| `GARMIN_MCP_DISABLE_AUTH_ENDPOINT = "true"` | removes `/auth` |
 | `auto_stop_machines = "suspend"`, `auto_start_machines = true`, `min_machines_running = 0` | sleeps when idle, wakes on the next request (see "Suspend when idle") |
 | the check on `/healthz` | lets Fly tell when the server is up |
 
@@ -139,12 +131,11 @@ first, or start the machine again with `fly machine start <machine-id> -a "$APP"
 fly logs -a "$APP" -n | grep -E 'API key|listening'
 curl -s  https://$APP.fly.dev/healthz                                         # ok
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://$APP.fly.dev/mcp     # 401: needs the token
-curl -s -o /dev/null -w '%{http_code}\n' https://$APP.fly.dev/auth            # 404: the endpoint is gone
 ```
 
-The log should say `API key from the environment accepted`. If it says the key was not
-accepted, or `needs a key from the start`, the secrets did not reach the machine: run
-`fly secrets deploy -a "$APP"`.
+The log should say `key_from=environment` and then `Garmin accepted the API key`. If the
+server stops with `no Garmin API key`, the secrets did not reach the machine: run
+`fly secrets deploy -a "$APP"`. If Garmin rejected the key, replace it (see Day-to-day).
 
 ## 6. Connect Claude
 
@@ -225,5 +216,5 @@ only, not CPU or memory.
   health checks send, and a failing check takes the app out of service. The server therefore
   never applies its hostname check to `/healthz`, which only ever answers `ok`.
 - **The whole server is public.** Unlike the Compose setup, where Caddy exposes only `/mcp`,
-  Fly forwards every path. That is fine here: `/auth` does not exist, `/mcp` needs the token,
-  and `/healthz` reveals nothing.
+  Fly forwards every path. That is fine here: the server has nothing but `/mcp`, which
+  needs the token, and `/healthz`, which reveals nothing.

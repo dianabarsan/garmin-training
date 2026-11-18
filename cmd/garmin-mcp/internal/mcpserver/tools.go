@@ -429,24 +429,6 @@ func (s *Server) getActivitySeries(ctx context.Context, in seriesIn) (seriesOut,
 
 // registerTools adds every tool to the MCP server.
 func (s *Server) registerTools() {
-	addTool(s, "auth_status", "Check Garmin authentication",
-		"Reports whether a Garmin Personal API key has been provided. Use it when another tool fails with an authentication error.",
-		s.authStatus)
 	s.registerActivityTools()
 	s.registerHealthTools()
-}
-
-// authStatus handles the auth_status tool.
-func (s *Server) authStatus(_ context.Context, _ struct{}) (statusOut, error) {
-	st := s.creds.Status()
-	out := statusOut{Authenticated: st.Authenticated}
-	if !st.Authenticated {
-		out.Help = capitalize(s.askUserToProvideKey()) + ". The key is created at connect.garmin.com/app/settings/personalApiToken."
-	}
-	return out, nil
-}
-
-type statusOut struct {
-	Authenticated bool   `json:"authenticated"`
-	Help          string `json:"help,omitempty"`
 }

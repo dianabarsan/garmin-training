@@ -12,18 +12,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// authed returns a harness that is already authenticated.
-func authed(t *testing.T) *harness {
+// harnessCS returns a harness and a helper calling tools over its client session.
+func harnessCS(t *testing.T) (*harness, func(name string, args map[string]any) *mcp.CallToolResult) {
 	t.Helper()
 	h := newHarness(t)
-	h.authenticate(t)
-	return h
-}
-
-// authedCS returns an authenticated harness's client session and a call helper.
-func authedCS(t *testing.T) (*harness, func(name string, args map[string]any) *mcp.CallToolResult) {
-	t.Helper()
-	h := authed(t)
 	cs := h.connect(t)
 	return h, func(name string, args map[string]any) *mcp.CallToolResult { return callTool(t, cs, name, args) }
 }
@@ -84,36 +76,16 @@ func TestTools_ListAreRegisteredReadOnlyWithSchemas(t *testing.T) {
 		}
 	}
 	sort.Strings(names)
-	want := []string{"auth_status", "get_activity", "get_activity_series", "get_activity_splits", "get_body_battery", "get_daily_summaries",
+	want := []string{"get_activity", "get_activity_series", "get_activity_splits", "get_body_battery", "get_daily_summaries",
 		"get_heart_rate", "get_heart_rate_zones", "get_hrv", "get_sleep", "get_steps", "get_stress", "get_vo2max", "list_activities"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Errorf("tools = %v\nwant    %v", names, want)
 	}
 }
 
-func TestTools_AuthStatus(t *testing.T) {
+func TestTools_AllReportARejectedKey(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t)
-	cs := h.connect(t)
-	type out struct {
-		Authenticated bool   `json:"authenticated"`
-		Help          string `json:"help"`
-	}
-	before := decodeResult[out](t, callTool(t, cs, "auth_status", nil))
-	if before.Authenticated || !strings.Contains(before.Help, "/auth") {
-		t.Errorf("before: %+v", before)
-	}
-	h.authenticate(t)
-	after := decodeResult[out](t, callTool(t, cs, "auth_status", nil))
-	if !after.Authenticated || after.Help != "" {
-		t.Errorf("after: %+v", after)
-	}
-}
-
-func TestTools_AllRequireAuthentication(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t)
-	cs := h.connect(t)
+	cs := newHarnessWithKey(t, "revoked-key").connect(t)
 	for name, args := range map[string]map[string]any{
 		"list_activities": nil, "get_activity": {"activity_id": 1}, "get_activity_splits": {"activity_id": 1},
 		"get_activity_series": {"activity_id": 1}, "get_daily_summaries": nil, "get_sleep": nil, "get_heart_rate": nil,
@@ -121,26 +93,26 @@ func TestTools_AllRequireAuthentication(t *testing.T) {
 	} {
 		res := callTool(t, cs, name, args)
 		txt := resultText(res)
-		if !res.IsError || !strings.Contains(txt, "no Garmin API key") || !strings.Contains(txt, "/auth") {
+		if !res.IsError || !strings.Contains(txt, "rejected") || !strings.Contains(txt, "setup.sh --new-key") {
 			t.Errorf("%s: IsError=%v text=%q", name, res.IsError, txt)
 		}
 	}
 }
 
-func TestTools_ExpiredKeyGivesActionableMessage(t *testing.T) {
+// A key revoked while the server runs: Garmin refuses the access token.
+func TestTools_RevokedKeyGivesActionableMessage(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.authenticate(t)
 	h.fg.status["/usersummary-service/stats/steps/daily/2026-11-10/2026-11-16"] = 401
 	res := callTool(t, h.connect(t), "get_steps", nil)
-	if !res.IsError || !strings.Contains(resultText(res), "expired") || !strings.Contains(resultText(res), "/auth") {
+	if !res.IsError || !strings.Contains(resultText(res), "expired") || !strings.Contains(resultText(res), "setup.sh --new-key") {
 		t.Errorf("text = %q", resultText(res))
 	}
 }
 
 func TestTools_ListActivities(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/activitylist-service/activities/search/activities", "["+runListJSON+","+strengthListJSON+"]")
 
@@ -203,7 +175,7 @@ func TestTools_ListActivities(t *testing.T) {
 
 func TestTools_ListActivitiesForwardsFilters(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/activitylist-service/activities/search/activities", "[]")
 	callTool(t, cs, "list_activities", map[string]any{
@@ -223,7 +195,7 @@ func TestTools_ListActivitiesForwardsFilters(t *testing.T) {
 
 func TestTools_ListActivitiesValidatesInput(t *testing.T) {
 	t.Parallel()
-	_, call := authedCS(t)
+	_, call := harnessCS(t)
 	for name, args := range map[string]map[string]any{
 		"limit too high":   {"limit": 101},
 		"negative limit":   {"limit": -1},
@@ -240,7 +212,7 @@ func TestTools_ListActivitiesValidatesInput(t *testing.T) {
 
 func TestTools_GetActivity(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/activity-service/activity/42", `{"activityId":42,"activityName":"Morning Run","activityTypeDTO":{"typeKey":"running"},
 	  "timeZoneUnitDTO":{"timeZone":"Europe/Bucharest"},
@@ -302,7 +274,7 @@ func TestTools_GetActivity(t *testing.T) {
 
 func TestTools_ActivitySplits(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/activity-service/activity/42/details", detailsBody(4, 2500, true))
 	type split struct {
@@ -342,7 +314,7 @@ func TestTools_ActivitySplits(t *testing.T) {
 
 func TestTools_ActivitySplitsWithoutDistance(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/activity-service/activity/43/details", detailsBody(0, 0, false))
 	res := callTool(t, cs, "get_activity_splits", map[string]any{"activity_id": 43})
@@ -353,7 +325,7 @@ func TestTools_ActivitySplitsWithoutDistance(t *testing.T) {
 
 func TestTools_ActivitySeriesIsThinnedEvenlyAndHasNoGPS(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/activity-service/activity/42/details", detailsBody(4, 2500, true)) // 626 samples
 	type point struct {
@@ -442,7 +414,7 @@ func TestTools_RawData(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.tool, func(t *testing.T) {
 			t.Parallel()
-			h := authed(t)
+			h := newHarness(t)
 			cs := h.connect(t)
 			h.fg.route(tt.path, tt.body)
 

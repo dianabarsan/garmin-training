@@ -27,9 +27,9 @@ COPY --from=build /out/garmin-mcp /garmin-mcp
 COPY --from=build --chown=65532:65532 /data /data
 USER 65532:65532
 EXPOSE 8808
-# The start period covers checking a key from the environment with Garmin
-# (up to 20 s) before the server starts listening.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+# The server listens within a second of starting; it checks the key with Garmin
+# afterwards, without holding up the health check.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["/garmin-mcp", "-healthcheck", "-addr", ":8808"]
 ENTRYPOINT ["/garmin-mcp"]
 CMD ["-addr", ":8808", "-key-store", "/data/garmin.key"]

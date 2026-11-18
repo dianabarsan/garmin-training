@@ -12,7 +12,7 @@ type dayList[T any] struct {
 
 func TestTools_DefaultRangeIsTheLastSevenDaysEndingToday(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/usersummary-service/stats/steps/daily/2026-11-10/2026-11-16", `[]`)
 	h.fg.route("/usersummary-service/stats/steps/daily/2026-11-01/2026-11-05", `[]`)
@@ -40,7 +40,7 @@ func TestTools_DefaultRangeIsTheLastSevenDaysEndingToday(t *testing.T) {
 
 func TestTools_DateValidation(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	for name, tc := range map[string]struct {
 		tool string
@@ -68,7 +68,7 @@ func TestTools_DateValidation(t *testing.T) {
 
 func TestTools_DailySummaries(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/usersummary-service/v2/dailysummaries", `{"data":[
 	 {"calendarDate":"2026-11-15","movement":{"steps":{"value":8123,"goal":10000,"distanceInMeters":6100.55},"floorsAscended":{"value":12}},
@@ -111,7 +111,7 @@ func TestTools_DailySummaries(t *testing.T) {
 
 func TestTools_SleepIncludingNapOnlyDays(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/sleep-service/sleep/dailySleepSummariesByDate", `[
 	 {"id":7,"calendarDate":"2026-11-15","sleepTimeSeconds":27000,"deepSleepSeconds":5400,"lightSleepSeconds":15000,"remSleepSeconds":6600,
@@ -153,7 +153,7 @@ func TestTools_SleepIncludingNapOnlyDays(t *testing.T) {
 
 func TestTools_HeartRate(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	// 10:00, 10:10, 10:20 fall in the 10:00 half-hour bucket (avg 70); 10:40 in 10:30 (90).
 	h.fg.route("/wellness-service/wellness/dailyHeartRate", `{"calendarDate":"2026-11-15","restingHeartRate":50,"minHeartRate":44,"maxHeartRate":170,
@@ -190,7 +190,7 @@ func TestTools_HeartRate(t *testing.T) {
 
 func TestTools_HeartRateDefaultsToToday(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/wellness-service/wellness/dailyHeartRate", `{"restingHeartRate":50}`)
 	out := decodeResult[struct {
@@ -203,7 +203,7 @@ func TestTools_HeartRateDefaultsToToday(t *testing.T) {
 
 func TestTools_HRVBodyBatteryStressSteps(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/hrv-service/hrv/daily/2026-11-10/2026-11-16", `{"hrvSummaries":[
 	 {"calendarDate":"2026-11-15","weeklyAvg":40,"lastNightAvg":43,"lastNight5MinHigh":69,"status":"BALANCED","feedbackPhrase":"HRV_BALANCED_2",
@@ -269,7 +269,7 @@ func TestTools_HRVBodyBatteryStressSteps(t *testing.T) {
 
 func TestTools_VO2MaxAndZones(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.route("/metrics-service/metrics/maxmet/daily/2026-11-01/2026-11-16", `[
 	 {"generic":{"calendarDate":"2026-11-10","sport":"RUNNING","subSport":"GENERIC","vo2MaxValue":47.0,"vo2MaxPreciseValue":46.94},"cycling":null},
@@ -323,7 +323,7 @@ func TestTools_VO2MaxAndZones(t *testing.T) {
 
 func TestTools_GarminErrorsBecomeToolErrorsNotProtocolErrors(t *testing.T) {
 	t.Parallel()
-	h := authed(t)
+	h := newHarness(t)
 	cs := h.connect(t)
 	h.fg.status["/usersummary-service/stats/steps/daily/2026-11-10/2026-11-16"] = 429
 	if res := callTool(t, cs, "get_steps", nil); !res.IsError || !strings.Contains(resultText(res), "rate limiting") {

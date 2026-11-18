@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,51 +15,106 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dianabarsan/garmin-training/cmd/garmin-mcp/internal/mcpserver"
 	"github.com/dianabarsan/garmin-training/garmin-connect/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func TestRun_EndToEnd_ProvideKeyThenUseTools(t *testing.T) {
-	garminSrv, _ := fakeGarmin(t)
-	base, logs, stop := start(t, nil, "-garmin-url", garminSrv.URL)
+// setKeyCmd runs -set-key with key on standard input.
+func setKeyCmd(t *testing.T, garminURL, store, key string) (string, error) {
+	t.Helper()
+	var out syncBuf
+	err := run(context.Background(), []string{"-set-key", "-key-store", store, "-garmin-url", garminURL}, noEnv, strings.NewReader(key+"\n"), &out, io.Discard, nil)
+	return out.String(), err
+}
 
-	if code, body := get(t, base+"/healthz", nil); code != 200 || !strings.Contains(body, "ok") {
-		t.Errorf("healthz: %d %q", code, body)
-	}
-	if code, body := get(t, base+"/auth", nil); code != 200 || !strings.Contains(body, `"authenticated":false`) {
-		t.Errorf("status before: %d %s", code, body)
-	}
-	if code, _ := post(t, base+"/auth", `{"api_key":"wrong"}`); code != 401 {
-		t.Errorf("wrong key: %d", code)
-	}
-	if code, body := post(t, base+"/auth", `{"api_key":"`+goodKey+`"}`); code != 200 || !strings.Contains(body, `"authenticated":true`) {
-		t.Fatalf("good key: %d %s", code, body)
-	}
-
+// getSteps calls the get_steps tool over HTTP.
+func getSteps(t *testing.T, base string) error {
+	t.Helper()
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "1"}, nil).
 		Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: base + "/mcp"}, nil)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	defer cs.Close()
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "get_steps"})
-	if err != nil || res.IsError {
-		t.Fatalf("get_steps: err=%v res=%+v", err, res)
+	if err != nil {
+		return err
 	}
 	b, _ := json.Marshal(res.StructuredContent)
-	if !strings.Contains(string(b), `"steps":4321`) {
-		t.Errorf("tool output = %s", b)
+	if res.IsError || !strings.Contains(string(b), `"steps":4321`) {
+		var text string
+		for _, c := range res.Content {
+			if tc, ok := c.(*mcp.TextContent); ok {
+				text += tc.Text
+			}
+		}
+		return fmt.Errorf("get_steps: %s %s", text, b)
+	}
+	return nil
+}
+
+// waitForLog waits until the log contains want, which the startup key check
+// writes shortly after the server starts listening.
+func waitForLog(t *testing.T, logs *syncBuf, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(logs.String(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the log never said %q:\n%s", want, logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRun_EndToEnd_SetKeyThenUseTools(t *testing.T) {
+	garminSrv, _ := fakeGarmin(t)
+	store := filepath.Join(t.TempDir(), "state", "garmin.key")
+
+	if _, err := setKeyCmd(t, garminSrv.URL, store, "wrong-key-SECRET"); err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Errorf("a rejected key: err = %v", err)
+	}
+	if _, err := os.Stat(store); !os.IsNotExist(err) {
+		t.Errorf("a rejected key must not be saved: %v", err)
+	}
+	out, err := setKeyCmd(t, garminSrv.URL, store, goodKey)
+	if err != nil || !strings.Contains(out, "saved") || strings.Contains(out, goodKey) {
+		t.Fatalf("a good key: %q %v", out, err)
+	}
+	if info, err := os.Stat(store); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("key file: %v %v, want mode 0600", info, err)
 	}
 
+	base, logs, stop := start(t, nil, "-garmin-url", garminSrv.URL, "-key-store", store)
+	if code, body := get(t, base+"/healthz", nil); code != 200 || !strings.Contains(body, "ok") {
+		t.Errorf("healthz: %d %q", code, body)
+	}
+	if err := getSteps(t, base); err != nil {
+		t.Fatal(err)
+	}
+	waitForLog(t, logs, "Garmin accepted the API key")
 	if err := stop(); err != nil {
 		t.Errorf("shutdown: %v", err)
 	}
-	if strings.Contains(logs.String(), goodKey) || strings.Contains(logs.String(), "wrong") && strings.Contains(logs.String(), "api_key") {
-		t.Errorf("secrets in the log:\n%s", logs.String())
+	if strings.Contains(logs.String(), goodKey) {
+		t.Errorf("the key is in the log:\n%s", logs.String())
 	}
-	if !strings.Contains(logs.String(), "listening") {
-		t.Errorf("log lacks the startup line:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "key_from=\"key store\"") {
+		t.Errorf("the startup line should say where the key came from:\n%s", logs.String())
+	}
+}
+
+// The key can only be given to the server at startup: there is no endpoint for
+// it, and no key page.
+func TestRun_HasNoKeyEndpoint(t *testing.T) {
+	garminSrv, _ := fakeGarmin(t)
+	base, _, _ := start(t, nil, "-garmin-url", garminSrv.URL)
+	for _, path := range []string{"/auth", "/"} {
+		if code, _ := get(t, base+path, nil); code != 404 {
+			t.Errorf("GET %s -> %d, want 404", path, code)
+		}
+	}
+	if code, _ := post(t, base+"/auth", `{"api_key":"`+goodKey+`"}`); code != 404 {
+		t.Errorf("POST /auth -> %d, want 404", code)
 	}
 }
 
@@ -83,225 +140,151 @@ func TestRun_Healthcheck(t *testing.T) {
 	garminSrv, _ := fakeGarmin(t)
 	base, _, stop := start(t, map[string]string{"GARMIN_MCP_TOKEN": "tok-0123456789abcdef"}, "-garmin-url", garminSrv.URL)
 	hostPort := strings.TrimPrefix(base, "http://")
-	noEnv := func(string) string { return "" }
 
-	if err := run(context.Background(), []string{"-healthcheck", "-addr", hostPort}, noEnv, io.Discard, io.Discard, nil); err != nil {
+	if err := run(context.Background(), []string{"-healthcheck", "-addr", hostPort}, noEnv, nil, io.Discard, io.Discard, nil); err != nil {
 		t.Errorf("a healthy server (even with a token set) must pass: %v", err)
 	}
 	// A wildcard address, as used inside a container, is probed via loopback.
 	port := hostPort[strings.LastIndex(hostPort, ":")+1:]
 	for _, wildcard := range []string{":" + port, "0.0.0.0:" + port} {
-		if err := run(context.Background(), []string{"-healthcheck", "-addr", wildcard}, noEnv, io.Discard, io.Discard, nil); err != nil {
+		if err := run(context.Background(), []string{"-healthcheck", "-addr", wildcard}, noEnv, nil, io.Discard, io.Discard, nil); err != nil {
 			t.Errorf("-addr %s: %v", wildcard, err)
 		}
 	}
-	if err := run(context.Background(), []string{"-healthcheck", "-addr", "not-an-address"}, noEnv, io.Discard, io.Discard, nil); err == nil {
+	if err := run(context.Background(), []string{"-healthcheck", "-addr", "not-an-address"}, noEnv, nil, io.Discard, io.Discard, nil); err == nil {
 		t.Error("a malformed address must fail")
 	}
 	if err := stop(); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(context.Background(), []string{"-healthcheck", "-addr", hostPort}, noEnv, io.Discard, io.Discard, nil); err == nil {
+	if err := run(context.Background(), []string{"-healthcheck", "-addr", hostPort}, noEnv, nil, io.Discard, io.Discard, nil); err == nil {
 		t.Error("a stopped server must be reported unhealthy")
 	}
 }
 
 func TestRun_KeyFromEnvironment(t *testing.T) {
 	garminSrv, _ := fakeGarmin(t)
-	base, logs, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey}, "-garmin-url", garminSrv.URL)
-	if _, body := get(t, base+"/auth", nil); !strings.Contains(body, `"authenticated":true`) {
-		t.Errorf("a valid key in the environment should authenticate at start: %s\n%s", body, logs.String())
-	}
-	if strings.Contains(logs.String(), goodKey) {
-		t.Errorf("key in log:\n%s", logs.String())
-	}
-}
-
-func TestRun_BadEnvironmentKeyIsNotFatal(t *testing.T) {
-	garminSrv, _ := fakeGarmin(t)
-	const bad = "definitely-not-valid-SECRET"
-	base, logs, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": bad}, "-garmin-url", garminSrv.URL)
-	if _, body := get(t, base+"/auth", nil); !strings.Contains(body, `"authenticated":false`) {
-		t.Errorf("status: %s", body)
-	}
-	if !strings.Contains(logs.String(), "not accepted") {
-		t.Errorf("a rejected key should be reported:\n%s", logs.String())
-	}
-	if strings.Contains(logs.String(), bad) || strings.Contains(logs.String(), "SECRET") {
-		t.Errorf("the rejected key leaked into the log:\n%s", logs.String())
-	}
-	if code, _ := post(t, base+"/auth", `{"api_key":"`+goodKey+`"}`); code != 200 {
-		t.Errorf("the server must still accept a key at /auth: %d", code)
-	}
-}
-
-func TestRun_KeyStoreSurvivesARestart(t *testing.T) {
-	garminSrv, exchanges := fakeGarmin(t)
-	store := filepath.Join(t.TempDir(), "state", "garmin.key")
-
-	base1, _, stop1 := start(t, nil, "-garmin-url", garminSrv.URL, "-key-store", store)
-	if code, _ := post(t, base1+"/auth", `{"api_key":"`+goodKey+`"}`); code != 200 {
-		t.Fatalf("auth: %d", code)
-	}
-	if err := stop1(); err != nil {
+	// The environment wins over the key store.
+	store := filepath.Join(t.TempDir(), "garmin.key")
+	if err := os.WriteFile(store, []byte("stale-stored-key\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(store)
-	if err != nil {
-		t.Fatalf("key was not persisted: %v", err)
+	base, logs, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey}, "-garmin-url", garminSrv.URL, "-key-store", store)
+	if err := getSteps(t, base); err != nil {
+		t.Errorf("the key from the environment should be used: %v\n%s", err, logs.String())
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Errorf("store mode = %v, want 0600", info.Mode().Perm())
-	}
-
-	before := exchanges.Load()
-	base2, logs2, _ := start(t, nil, "-garmin-url", garminSrv.URL, "-key-store", store)
-	if _, body := get(t, base2+"/auth", nil); !strings.Contains(body, `"authenticated":true`) || !strings.Contains(body, `"persisted":true`) {
-		t.Errorf("after restart: %s\n%s", body, logs2.String())
-	}
-	if exchanges.Load() != before {
-		t.Error("loading the stored key must not call Garmin")
-	}
-
-	// Removing the key at /auth also removes it from disk.
-	req, _ := http.NewRequest("DELETE", base2+"/auth", nil)
-	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 {
-		t.Fatalf("DELETE: %v %v", resp, err)
-	}
-	if _, err := os.Stat(store); !os.IsNotExist(err) {
-		t.Errorf("key file still on disk after DELETE: %v", err)
+	waitForLog(t, logs, "Garmin accepted the API key")
+	if !strings.Contains(logs.String(), "key_from=environment") || strings.Contains(logs.String(), goodKey) {
+		t.Errorf("log:\n%s", logs.String())
 	}
 }
 
-func TestRun_DisableAuthEndpoint(t *testing.T) {
-	garminSrv, _ := fakeGarmin(t)
-	for name, tc := range map[string]struct {
-		env  map[string]string
-		args []string
-	}{
-		"flag":        {map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey}, []string{"-disable-auth-endpoint"}},
-		"environment": {map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey, "GARMIN_MCP_DISABLE_AUTH_ENDPOINT": "true"}, nil},
-	} {
-		base, logs, _ := start(t, tc.env, append([]string{"-garmin-url", garminSrv.URL}, tc.args...)...)
-		for _, path := range []string{"/auth", "/"} {
-			if code, _ := get(t, base+path, nil); code != 404 {
-				t.Errorf("%s: GET %s -> %d, want 404", name, path, code)
-			}
-		}
-		if code, _ := post(t, base+"/auth", `{"api_key":"`+goodKey+`"}`); code != 404 {
-			t.Errorf("%s: POST /auth -> %d, want 404", name, code)
-		}
-		if code, _ := get(t, base+"/healthz", nil); code != 200 {
-			t.Errorf("%s: healthz -> %d", name, code)
-		}
-		cs, err := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "1"}, nil).
-			Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: base + "/mcp"}, nil)
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "get_steps"})
-		cs.Close()
-		if err != nil || res.IsError {
-			t.Errorf("%s: the key from the environment must work: err=%v res=%+v", name, err, res)
-		}
-		if strings.Contains(logs.String(), "POST {") || strings.Contains(logs.String(), "browser") {
-			t.Errorf("%s: the log still tells you to use the removed endpoint:\n%s", name, logs.String())
-		}
-		if !strings.Contains(logs.String(), "auth_endpoint=false") {
-			t.Errorf("%s: the startup line should say the endpoint is off:\n%s", name, logs.String())
-		}
-	}
-}
-
-func TestRun_DisableAuthEndpointNeedsAKeyFromTheStart(t *testing.T) {
-	noEnv := func(string) string { return "" }
-	err := run(context.Background(), []string{"-addr", "127.0.0.1:0", "-disable-auth-endpoint"}, noEnv, io.Discard, io.Discard, nil)
-	if err == nil || !strings.Contains(err.Error(), "GARMIN_PERSONAL_API_KEY") {
+func TestRun_NeedsAKeyToStart(t *testing.T) {
+	err := run(context.Background(), []string{"-addr", "127.0.0.1:0"}, noEnv, nil, io.Discard, io.Discard, nil)
+	if err == nil || !strings.Contains(err.Error(), "GARMIN_PERSONAL_API_KEY") || !strings.Contains(err.Error(), "-set-key") {
 		t.Errorf("no key at all: err = %v, want advice on how to supply one", err)
 	}
-	// A key store that does not exist yet is the same situation.
-	err = run(context.Background(), []string{"-addr", "127.0.0.1:0", "-disable-auth-endpoint", "-key-store", filepath.Join(t.TempDir(), "absent")}, noEnv, io.Discard, io.Discard, nil)
-	if err == nil || !strings.Contains(err.Error(), "-key-store") {
-		t.Errorf("empty key store: err = %v", err)
-	}
-	// An unparsable environment value is reported, not ignored.
-	bad := func(k string) string {
-		if k == "GARMIN_MCP_DISABLE_AUTH_ENDPOINT" {
-			return "maybe"
+	for name, content := range map[string]*string{"missing": nil, "blank": ptr(" \n")} {
+		store := filepath.Join(t.TempDir(), "garmin.key")
+		if content != nil {
+			_ = os.WriteFile(store, []byte(*content), 0o600)
 		}
-		return ""
-	}
-	if err := run(context.Background(), []string{"-addr", "127.0.0.1:0"}, bad, io.Discard, io.Discard, nil); err == nil || !strings.Contains(err.Error(), "true or false") {
-		t.Errorf("bad env value: err = %v", err)
-	}
-}
-
-// The documented way to test through a tunnel: store the key once with /auth,
-// then restart with the endpoint removed and let the key store supply it.
-func TestRun_StoreTheKeyThenRestartWithoutTheEndpoint(t *testing.T) {
-	garminSrv, _ := fakeGarmin(t)
-	store := filepath.Join(t.TempDir(), "garmin.key")
-
-	base1, _, stop1 := start(t, nil, "-garmin-url", garminSrv.URL, "-key-store", store)
-	if code, _ := post(t, base1+"/auth", `{"api_key":"`+goodKey+`"}`); code != 200 {
-		t.Fatalf("storing the key: %d", code)
-	}
-	if err := stop1(); err != nil {
-		t.Fatal(err)
-	}
-
-	base2, logs2, _ := start(t, nil, "-garmin-url", garminSrv.URL, "-key-store", store, "-disable-auth-endpoint")
-	if code, _ := get(t, base2+"/auth", nil); code != 404 {
-		t.Errorf("/auth after restart: %d, want 404", code)
-	}
-	cs, err := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "1"}, nil).
-		Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: base2 + "/mcp"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cs.Close()
-	if res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "get_steps"}); err != nil || res.IsError {
-		t.Errorf("the stored key should work without the endpoint: err=%v res=%+v\n%s", err, res, logs2.String())
+		err := run(context.Background(), []string{"-addr", "127.0.0.1:0", "-key-store", store}, noEnv, nil, io.Discard, io.Discard, nil)
+		if err == nil || !strings.Contains(err.Error(), "-set-key") {
+			t.Errorf("%s key store: err = %v", name, err)
+		}
 	}
 }
 
-func TestRun_RejectedKeyWithoutTheEndpointSaysToRestart(t *testing.T) {
+func ptr[T any](v T) *T { return &v }
+
+// A rejected key is reported but not fatal: the server keeps answering, and
+// the tools say what to do.
+func TestRun_RejectedKeyIsReported(t *testing.T) {
 	garminSrv, _ := fakeGarmin(t)
-	base, logs, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": "not-the-key-SECRET"}, "-garmin-url", garminSrv.URL, "-disable-auth-endpoint")
+	base, logs, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": "not-the-key-SECRET"}, "-garmin-url", garminSrv.URL)
+	waitForLog(t, logs, "Garmin rejected the API key")
 	if code, _ := get(t, base+"/healthz", nil); code != 200 {
-		t.Errorf("a rejected key is not fatal: %d", code)
+		t.Errorf("healthz: %d", code)
 	}
-	if !strings.Contains(logs.String(), "restart with a new key") || strings.Contains(logs.String(), "provide a key at /auth") {
-		t.Errorf("the warning must say to restart, not to use /auth:\n%s", logs.String())
+	if err := getSteps(t, base); err == nil || !strings.Contains(err.Error(), "setup.sh --new-key") {
+		t.Errorf("the tool should say how to replace the key: %v", err)
 	}
 	if strings.Contains(logs.String(), "SECRET") {
 		t.Errorf("the rejected key leaked into the log:\n%s", logs.String())
 	}
 }
 
-// A key from the environment that cannot be checked because Garmin is
-// unreachable is used anyway, not discarded: otherwise a network blip at
-// startup would leave a server without /auth unusable until restarted.
-func TestRun_UnreachableGarminKeepsTheEnvironmentKey(t *testing.T) {
+// A key that cannot be checked because Garmin is unreachable is kept, so a
+// network blip at startup does not leave the server unusable.
+func TestRun_UnreachableGarminKeepsTheKey(t *testing.T) {
 	closed := httptest.NewServer(http.NotFoundHandler())
 	unreachable := closed.URL
 	closed.Close()
 
 	base, logs, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey}, "-garmin-url", unreachable)
-	if _, body := get(t, base+"/auth", nil); !strings.Contains(body, `"authenticated":true`) {
-		t.Errorf("the unchecked key should be in use: %s\n%s", body, logs.String())
+	waitForLog(t, logs, "could not check the API key")
+	if !strings.Contains(logs.String(), "could not reach Garmin") || strings.Contains(logs.String(), goodKey) {
+		t.Errorf("log:\n%s", logs.String())
 	}
-	if !strings.Contains(logs.String(), "using it anyway") || !strings.Contains(logs.String(), "could not reach Garmin") {
-		t.Errorf("the log should say the key could not be checked:\n%s", logs.String())
+	if code, _ := get(t, base+"/healthz", nil); code != 200 {
+		t.Errorf("healthz: %d", code)
 	}
-	if strings.Contains(logs.String(), goodKey) {
-		t.Errorf("key in log:\n%s", logs.String())
-	}
+}
 
-	// Without the endpoint the server must still start, with the key.
-	_, logs2, _ := start(t, map[string]string{"GARMIN_PERSONAL_API_KEY": goodKey}, "-garmin-url", unreachable, "-disable-auth-endpoint")
-	if !strings.Contains(logs2.String(), "key_loaded=true") {
-		t.Errorf("with -disable-auth-endpoint the key should be loaded:\n%s", logs2.String())
+func TestRun_SetKeyFailures(t *testing.T) {
+	garminSrv, _ := fakeGarmin(t)
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	store := filepath.Join(t.TempDir(), "garmin.key")
+
+	if err := run(context.Background(), []string{"-set-key", "-garmin-url", garminSrv.URL}, noEnv, strings.NewReader(goodKey), io.Discard, io.Discard, nil); err == nil || !strings.Contains(err.Error(), "-key-store") {
+		t.Errorf("without -key-store: %v", err)
+	}
+	if _, err := setKeyCmd(t, garminSrv.URL, store, "  "); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf("empty input: %v", err)
+	}
+	if _, err := setKeyCmd(t, garminSrv.URL, store, strings.Repeat("k", maxKeyInput+1)); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Errorf("oversized input: %v", err)
+	}
+	for _, in := range []string{goodKey + " " + goodKey, goodKey + "\n" + goodKey, goodKey + "\x00"} {
+		if _, err := setKeyCmd(t, garminSrv.URL, store, in); err == nil || !strings.Contains(err.Error(), "one line") {
+			t.Errorf("key with whitespace or control characters %q: %v", in, err)
+		}
+	}
+	if _, err := setKeyCmd(t, closed.URL, store, goodKey); err == nil || !strings.Contains(err.Error(), "not saved") {
+		t.Errorf("Garmin unreachable: %v", err)
+	}
+	if _, err := os.Stat(store); !os.IsNotExist(err) {
+		t.Errorf("a key that could not be checked must not be saved: %v", err)
+	}
+	// A save failure is reported.
+	file := filepath.Join(t.TempDir(), "file")
+	_ = os.WriteFile(file, nil, 0o600)
+	if _, err := setKeyCmd(t, garminSrv.URL, filepath.Join(file, "key"), goodKey); err == nil {
+		t.Error("saving under a regular file should fail")
+	}
+}
+
+func TestRun_KeyStored(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "garmin.key")
+	stored := func() error {
+		return run(context.Background(), []string{"-key-stored", "-key-store", store}, noEnv, nil, io.Discard, io.Discard, nil)
+	}
+	if err := stored(); err == nil {
+		t.Error("no file: want an error")
+	}
+	_ = os.WriteFile(store, []byte("\n"), 0o600)
+	if err := stored(); err == nil {
+		t.Error("blank file: want an error")
+	}
+	_ = os.WriteFile(store, []byte("SECRET-KEY\n"), 0o600)
+	var out syncBuf
+	if err := run(context.Background(), []string{"-key-stored", "-key-store", store}, noEnv, nil, &out, &out, nil); err != nil || strings.Contains(out.String(), "SECRET") {
+		t.Errorf("stored key: err=%v output=%q", err, out.String())
+	}
+	if err := run(context.Background(), []string{"-key-stored"}, noEnv, nil, io.Discard, io.Discard, nil); err == nil {
+		t.Error("without -key-store: want an error")
 	}
 }
 
@@ -310,9 +293,10 @@ func TestReasonOf(t *testing.T) {
 		nil:                      "",
 		auth.ErrInvalidKey:       "rejected by Garmin",
 		auth.ErrMalformedToken:   "unexpected answer from Garmin",
-		mcpserver.ErrKeyNotSaved: "could not save it to the key store",
 		context.DeadlineExceeded: "Garmin did not answer in time",
-		errors.New("dial tcp /secret/path: refused"): "could not reach Garmin",
+		&net.OpError{Op: "dial", Err: errors.New("/secret/path: refused")}: "could not reach Garmin",
+		&net.DNSError{Name: "example.invalid"}:                             "could not reach Garmin",
+		errors.New("net/http: invalid header field value"):                 "the check failed",
 	} {
 		if got := reasonOf(err); got != want {
 			t.Errorf("reasonOf(%v) = %q, want %q", err, got, want)
@@ -322,7 +306,7 @@ func TestReasonOf(t *testing.T) {
 
 func TestRun_RefusesToExposeItselfWithoutAToken(t *testing.T) {
 	var logs syncBuf
-	err := run(context.Background(), []string{"-addr", "0.0.0.0:0"}, func(string) string { return "" }, io.Discard, &logs, nil)
+	err := run(context.Background(), []string{"-addr", "0.0.0.0:0"}, keyEnv, nil, io.Discard, &logs, nil)
 	if err == nil || !strings.Contains(err.Error(), "token") {
 		t.Fatalf("err = %v, want a refusal that mentions the token", err)
 	}
@@ -331,7 +315,13 @@ func TestRun_RefusesToExposeItselfWithoutAToken(t *testing.T) {
 	ready := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, []string{"-addr", "0.0.0.0:0", "-token", "flag-token-0123456789"}, func(string) string { return "" }, io.Discard, &logs, func(a string) { ready <- a })
+		env := func(k string) string {
+			if k == "GARMIN_MCP_TOKEN" {
+				return "env-token-0123456789"
+			}
+			return keyEnv(k)
+		}
+		done <- run(ctx, []string{"-addr", "0.0.0.0:0", "-garmin-url", "http://127.0.0.1:1"}, env, nil, io.Discard, &logs, func(a string) { ready <- a })
 	}()
 	select {
 	case <-ready:
@@ -347,25 +337,24 @@ func TestRun_RefusesToExposeItselfWithoutAToken(t *testing.T) {
 }
 
 func TestRun_FlagsAndVersion(t *testing.T) {
-	noEnv := func(string) string { return "" }
 	var out syncBuf
-	if err := run(context.Background(), []string{"-version"}, noEnv, &out, io.Discard, nil); err != nil || !strings.Contains(out.String(), "garmin-mcp") {
+	if err := run(context.Background(), []string{"-version"}, noEnv, nil, &out, io.Discard, nil); err != nil || !strings.Contains(out.String(), "garmin-mcp") {
 		t.Errorf("-version: %v %q", err, out.String())
 	}
 	out = syncBuf{}
-	if err := run(context.Background(), []string{"-h"}, noEnv, io.Discard, &out, nil); err != nil || !strings.Contains(out.String(), "GARMIN_PERSONAL_API_KEY") {
+	if err := run(context.Background(), []string{"-h"}, noEnv, nil, io.Discard, &out, nil); err != nil || !strings.Contains(out.String(), "GARMIN_PERSONAL_API_KEY") {
 		t.Errorf("-h: %v %q", err, out.String())
 	}
-	if err := run(context.Background(), []string{"-nope"}, noEnv, io.Discard, io.Discard, nil); err == nil {
+	if err := run(context.Background(), []string{"-nope"}, noEnv, nil, io.Discard, io.Discard, nil); err == nil {
 		t.Error("an unknown flag must be an error")
 	}
-	if err := run(context.Background(), []string{"-log-level", "loud"}, noEnv, io.Discard, io.Discard, nil); err == nil || !strings.Contains(err.Error(), "log-level") {
+	if err := run(context.Background(), []string{"-log-level", "loud"}, noEnv, nil, io.Discard, io.Discard, nil); err == nil || !strings.Contains(err.Error(), "log-level") {
 		t.Errorf("bad log level: %v", err)
 	}
 	// An address that is already in use is reported, not swallowed.
 	l := httptest.NewServer(http.NotFoundHandler())
 	defer l.Close()
-	if err := run(context.Background(), []string{"-addr", strings.TrimPrefix(l.URL, "http://")}, noEnv, io.Discard, io.Discard, nil); err == nil {
+	if err := run(context.Background(), []string{"-addr", strings.TrimPrefix(l.URL, "http://")}, keyEnv, nil, io.Discard, io.Discard, nil); err == nil {
 		t.Error("listening on a busy port must fail")
 	}
 }

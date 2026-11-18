@@ -1,11 +1,11 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -27,8 +27,9 @@ type config struct {
 	auditMaxMB   int64 // rotate the audit file past this size; 0 = never
 	garminURL    string
 	logLevel     string
-	envKey       string // initial API key from GARMIN_PERSONAL_API_KEY[_FILE]
-	disableAuth  bool   // serve no /auth endpoint or key page
+	envKey       string // API key from GARMIN_PERSONAL_API_KEY[_FILE]
+	setKey       bool   // read a key from stdin, check it and save it to keyStore
+	keyStored    bool   // report whether keyStore holds a key
 	healthcheck  bool
 	showVersion  bool
 }
@@ -37,7 +38,7 @@ type config struct {
 // help was requested. Secrets may come from the environment or, safer in
 // containers, from a file named by NAME_FILE (the Docker secrets convention).
 func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (config, error) {
-	tokenDefault, err := secret(getenv, "GARMIN_MCP_TOKEN")
+	token, err := secret(getenv, "GARMIN_MCP_TOKEN")
 	if err != nil {
 		return config{}, err
 	}
@@ -45,37 +46,37 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	if err != nil {
 		return config{}, err
 	}
-	disableDefault, err := boolEnv(getenv, "GARMIN_MCP_DISABLE_AUTH_ENDPOINT")
-	if err != nil {
-		return config{}, err
-	}
 
 	fs := flag.NewFlagSet("garmin-mcp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cfg := config{envKey: envKey}
+	cfg := config{envKey: envKey, token: token}
 	var allowedHosts string
-	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8808", "address to listen on; a non-loopback address requires -token")
-	// The token flag has no default: flag.PrintDefaults would print the token
-	// from the environment in the -h output. It is filled in after parsing.
-	fs.StringVar(&cfg.token, "token", "", fmt.Sprintf("require this bearer token, at least %d characters, on /mcp and /auth; prefer env GARMIN_MCP_TOKEN or GARMIN_MCP_TOKEN_FILE, since a command-line value is visible in the process list", minTokenLen))
+	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8808", "address to listen on; a non-loopback address requires a token (GARMIN_MCP_TOKEN)")
 	fs.StringVar(&allowedHosts, "allowed-host", getenv("GARMIN_MCP_ALLOWED_HOSTS"), "comma-separated public hostnames this server may be reached as, e.g. garmin.example.com; set it behind a reverse proxy. On Fly.io, <FLY_APP_NAME>.fly.dev is added automatically (env GARMIN_MCP_ALLOWED_HOSTS)")
-	fs.BoolVar(&cfg.disableAuth, "disable-auth-endpoint", disableDefault, "do not serve /auth or the key page (both answer 404), so the key can only come from GARMIN_PERSONAL_API_KEY[_FILE] or -key-store; use it when the server is reachable from outside (env GARMIN_MCP_DISABLE_AUTH_ENDPOINT)")
+	fs.BoolVar(&cfg.setKey, "set-key", false, "read a Garmin API key from standard input, check it with Garmin, save it to -key-store and exit")
+	fs.BoolVar(&cfg.keyStored, "key-stored", false, "exit 0 if -key-store holds a key, 1 if not; the key is not checked with Garmin")
 	fs.BoolVar(&cfg.healthcheck, "healthcheck", false, "probe a running server at -addr and exit 0 if it is healthy (for container health checks)")
-	fs.StringVar(&cfg.keyStore, "key-store", getenv("GARMIN_MCP_KEY_STORE"), "file in which to keep the API key between restarts, mode 0600 (env GARMIN_MCP_KEY_STORE); the key stays in memory only when unset")
-	fs.StringVar(&cfg.auditLog, "audit-log", getenv("GARMIN_MCP_AUDIT_LOG"), "append the audit trail (tool calls, refused requests, key changes) to this file as JSON lines, mode 0600; without it the records appear in the normal log tagged audit=true (env GARMIN_MCP_AUDIT_LOG)")
+	fs.StringVar(&cfg.keyStore, "key-store", getenv("GARMIN_MCP_KEY_STORE"), "file holding the API key, mode 0600, written by -set-key; GARMIN_PERSONAL_API_KEY takes precedence (env GARMIN_MCP_KEY_STORE)")
+	fs.StringVar(&cfg.auditLog, "audit-log", getenv("GARMIN_MCP_AUDIT_LOG"), "append the audit trail (tool calls and refused requests) to this file as JSON lines, mode 0600; without it the records appear in the normal log tagged audit=true (env GARMIN_MCP_AUDIT_LOG)")
 	fs.Int64Var(&cfg.auditMaxMB, "audit-log-max-mb", 10, "when the audit file grows past this many megabytes it is renamed to <file>.1 (replacing an older one) and a new file is started; 0 disables the limit")
 	fs.StringVar(&cfg.garminURL, "garmin-url", getenv("GARMIN_PERSONAL_API_BASE_URL"), "Garmin API base URL; for testing")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key is read from GARMIN_PERSONAL_API_KEY at startup, or\nprovided later at http://<addr>/ or by POSTing {\"api_key\": \"...\"} to /auth\n(unless -disable-auth-endpoint is set).\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage: garmin-mcp [flags]\n\nThe Garmin Personal API key comes from GARMIN_PERSONAL_API_KEY (or\nGARMIN_PERSONAL_API_KEY_FILE), or from the -key-store file, where\n  garmin-mcp -set-key -key-store FILE\nsaves a key read from standard input.\n\nClients must send Authorization: Bearer <token> on /mcp when\nGARMIN_MCP_TOKEN (or GARMIN_MCP_TOKEN_FILE) is set; at least %d characters.\nIt is required on a non-loopback -addr.\n\nFlags:\n", minTokenLen)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
-	if cfg.token == "" {
-		cfg.token = tokenDefault
+	modes := 0
+	for _, on := range []bool{cfg.showVersion, cfg.healthcheck, cfg.setKey, cfg.keyStored} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return config{}, errors.New("use only one of -version, -healthcheck, -set-key and -key-stored")
 	}
 	if cfg.token != "" && len(cfg.token) < minTokenLen {
 		return config{}, fmt.Errorf("the token must be at least %d characters long (generate one with: openssl rand -hex 32)", minTokenLen)
@@ -124,17 +125,4 @@ func splitList(s string) []string {
 		}
 	}
 	return out
-}
-
-// boolEnv reads an optional boolean environment variable; unset means false.
-func boolEnv(getenv func(string) string, name string) (bool, error) {
-	v := strings.TrimSpace(getenv(name))
-	if v == "" {
-		return false, nil
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("%s must be true or false, got %q", name, v)
-	}
-	return b, nil
 }

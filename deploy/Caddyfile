@@ -9,8 +9,7 @@
 		-Server
 	}
 
-	# Only the MCP endpoint is public. /auth (where the Garmin key is replaced)
-	# and the key page are NOT reachable from the internet.
+	# Only the MCP endpoint is public; everything else answers 404.
 	@mcp path /mcp /mcp/*
 	handle @mcp {
 		# flush_interval -1 keeps MCP's event streams flowing instead of buffered.

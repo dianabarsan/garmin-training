@@ -11,11 +11,11 @@ whether or not your PC is on. It is two containers:
 ```
 phone / claude.ai ──https──▶ Caddy ──/mcp only──▶ garmin-mcp ──▶ Garmin
                               │
-                              └─ /auth, /, /healthz  →  404 from the internet
+                              └─ any other path  →  404 from the internet
 ```
 
-The Garmin key can therefore not be replaced from the internet, even with a leaked
-token. The server's own `/auth` is reachable only on the machine itself.
+The server reads the Garmin key from a file at startup and has no endpoint for it, so
+the key cannot be read or replaced over the network, even with a leaked token.
 
 (Prefer not to run a server yourself? [`docs/fly.md`](../docs/fly.md) hosts it on Fly.io.)
 
@@ -34,7 +34,7 @@ token. The server's own `/auth` is reachable only on the machine itself.
 pointing at the server.
 
 **2. Firewall.** Allow only SSH (ideally key-only), 80 and 443. Port 80 is used by
-Let's Encrypt. Nothing else needs to be open: the admin port is bound to loopback.
+Let's Encrypt. Nothing else needs to be open.
 
 **3. Code.** Put this repository on the server (`git clone`, or `rsync`).
 
@@ -68,14 +68,14 @@ the directory. Do not commit `secrets/` or `.env` (both are git-ignored).
 ```sh
 docker compose up -d --build
 docker compose ps                  # both services should be running; garmin-mcp "healthy"
-docker compose logs garmin-mcp     # look for: API key from the environment accepted
+docker compose logs garmin-mcp     # look for: Garmin accepted the API key
 ```
 
 **6. Check it from another machine.** The first should be `401`, the second `404`:
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://garmin.example.com/mcp
-curl -s -o /dev/null -w '%{http_code}\n' https://garmin.example.com/auth
+curl -s -o /dev/null -w '%{http_code}\n' https://garmin.example.com/healthz
 ```
 
 **7. Connect Claude.**
@@ -96,7 +96,6 @@ kilometre".
 | Task | How |
 |---|---|
 | Garmin key expired (30 days to a year) | Replace `secrets/garmin_key`, then `docker compose restart garmin-mcp`. |
-| Replace the key without touching files | `ssh -L 8808:127.0.0.1:8808 you@server`, then locally: `printf '{"api_key":"%s"}' "$KEY" \| curl -H "Authorization: Bearer $(ssh you@server cat deploy/secrets/mcp_token)" -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/auth` |
 | Rotate the Claude token | New value in `secrets/mcp_token`, `docker compose restart garmin-mcp`, update the connector's header. Do this if the token may have leaked. |
 | Update | `git pull && docker compose up -d --build` |
 | Logs | `docker compose logs -f` |
@@ -110,21 +109,13 @@ in the conversation.
 - **The token is the only credential for `/mcp`.** It is 256 bits of randomness, so it
   cannot be guessed, but anyone who holds it can read your Garmin data. Keep it out of
   chat logs and screenshots, and rotate it if it might have leaked.
-- **Data at rest:** the Garmin key is stored in a Docker volume (file mode `600`, owned
-  by the container's user) so the server survives restarts without you re-entering it.
-  Anyone with root on the server can read it. Use a provider you trust, keep the OS
+- **Data at rest:** the Garmin key is in `secrets/garmin_key` (see step 4). Anyone with
+  root on the server can read it. Use a provider you trust, keep the OS
   updated (for example `unattended-upgrades`), and use SSH keys only.
 - **Data in transit to Claude:** whatever a tool returns becomes part of your Claude
   conversation. The tools are read-only. They never return a GPS track, but each
   activity's raw data includes its start and end coordinates (see "Raw data" in the main
   README).
-- **Removing `/auth` altogether (optional):** Caddy already hides it from the internet. If
-  you want it gone from the server too, add `-disable-auth-endpoint` to the
-  `garmin-mcp` service's `command` in `compose.yaml` (for example
-  `command: ["-addr", ":8808", "-key-store", "/data/garmin.key", "-disable-auth-endpoint"]`).
-  The key then comes only from `secrets/garmin_key`, the admin port is no longer useful,
-  and rotating the key means replacing that file and restarting. This variant has not been
-  run through the full Compose test.
 - **Audit trail:** the server records every tool call and every refused request (wrong or
   missing token, wrong hostname, cross-origin attempts), never the key, the token or any
   data. See the audit section of the main README. Read it with
@@ -148,9 +139,9 @@ that do not clash with anything. Caddy then uses its own local certificate autho
 so use `-k` with curl:
 
 ```sh
-printf 'MCP_DOMAIN=garmin.localhost\nHTTP_PORT=18080\nHTTPS_PORT=18443\nADMIN_PORT=18808\n' > .env
+printf 'MCP_DOMAIN=garmin.localhost\nHTTP_PORT=18080\nHTTPS_PORT=18443\n' > .env
 docker compose up -d --build
-curl -sk --resolve garmin.localhost:18443:127.0.0.1 -o /dev/null -w '%{http_code}\n' https://garmin.localhost:18443/auth   # 404
+curl -sk --resolve garmin.localhost:18443:127.0.0.1 -o /dev/null -w '%{http_code}\n' https://garmin.localhost:18443/healthz   # 404
 docker compose down -v
 ```
 

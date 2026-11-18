@@ -1,5 +1,5 @@
 // Package auth exchanges a Garmin Connect Personal API key for short-lived
-// access tokens and caches them.
+// access tokens and caches them in memory.
 //
 // Create a key at https://connect.garmin.com/app/settings/personalApiToken.
 // The key cannot call data endpoints directly: it is exchanged for a JWT that
@@ -14,16 +14,12 @@ package auth
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,22 +60,13 @@ const (
 	maxExp = 253402300799
 )
 
-// Token is an access token and its expiry.
-type Token struct {
-	AccessToken string    `json:"access_token"`
-	ExpiresAt   time.Time `json:"expires_at"`
+// cachedToken is an access token and its expiry.
+type cachedToken struct {
+	AccessToken string
+	ExpiresAt   time.Time
 	// IssuedAt is when the token was obtained. With ExpiresAt it gives the
 	// token's lifetime, which bounds how early it is renewed.
-	IssuedAt time.Time `json:"issued_at,omitzero"`
-	// KeyFingerprint ties a cached token to the key and host that produced
-	// it, so changing either invalidates the cache. It is a salted SHA-256
-	// hash, so the key cannot be read back from it. The salt is stored beside
-	// it, so it only keeps fingerprints from being compared across files or
-	// against precomputed tables; what protects the key from guessing is its
-	// length.
-	KeyFingerprint string `json:"key_fingerprint"`
-	// KeySalt is the random salt of KeyFingerprint.
-	KeySalt string `json:"key_salt,omitempty"`
+	IssuedAt time.Time
 }
 
 // TokenSource returns access tokens for one API key. It is safe for
@@ -89,7 +76,6 @@ type TokenSource struct {
 	baseURL       string
 	urlErr        error // from checking baseURL; returned by AccessToken
 	httpClient    *http.Client
-	store         Store
 	now           func() time.Time
 	refreshBefore time.Duration
 
@@ -100,7 +86,7 @@ type TokenSource struct {
 	waiting atomic.Int32
 
 	mu       sync.Mutex // guards the fields below
-	token    Token
+	token    cachedToken
 	revoked  string // an access token reported invalid through Invalidate
 	attempts uint64 // exchanges finished, successful or not
 	lastErr  error  // error of the last exchange, nil if it succeeded
@@ -124,17 +110,6 @@ func WithHTTPClient(hc *http.Client) Option {
 		if hc != nil {
 			s.httpClient = hc
 		}
-	}
-}
-
-// WithStore persists tokens across process restarts. A nil store, including
-// a nil pointer of any Store type, means no store.
-func WithStore(st Store) Option {
-	return func(s *TokenSource) {
-		if v := reflect.ValueOf(st); v.Kind() == reflect.Pointer && v.IsNil() {
-			st = nil
-		}
-		s.store = st
 	}
 }
 
@@ -221,20 +196,6 @@ func (s *TokenSource) AccessToken(ctx context.Context) (string, error) {
 	}
 	s.mu.Unlock()
 
-	if s.store != nil {
-		// A broken cache must never block fetching a fresh token, so load
-		// errors are ignored.
-		if t, ok, err := s.store.Load(ctx); err == nil && ok && s.matches(t) {
-			s.mu.Lock()
-			if s.usable(t) {
-				s.token = t
-				s.mu.Unlock()
-				return t.AccessToken, nil
-			}
-			s.mu.Unlock()
-		}
-	}
-
 	t, err := s.exchange(ctx)
 	s.mu.Lock()
 	s.attempts++
@@ -251,18 +212,14 @@ func (s *TokenSource) AccessToken(ctx context.Context) (string, error) {
 	s.lastErr = nil
 	s.token = t
 	s.mu.Unlock()
-	if s.store != nil {
-		// The token is good; failing to cache it is not fatal.
-		_ = s.store.Save(ctx, t)
-	}
 	return t.AccessToken, nil
 }
 
 // Invalidate reports that token was refused by the API although it had not
 // expired, for example because Garmin revoked it. The next AccessToken call
-// exchanges the key for a new one instead of returning it again, from memory
-// or from the store. It satisfies garminconnect.TokenInvalidator, which the
-// client uses to recover from such a refusal on its own.
+// exchanges the key for a new one instead of returning it again. It
+// satisfies garminconnect.TokenInvalidator, which the client uses to recover
+// from such a refusal on its own.
 func (s *TokenSource) Invalidate(token string) {
 	if token == "" {
 		return
@@ -271,7 +228,7 @@ func (s *TokenSource) Invalidate(token string) {
 	defer s.mu.Unlock()
 	s.revoked = token
 	if s.token.AccessToken == token {
-		s.token = Token{}
+		s.token = cachedToken{}
 	}
 }
 
@@ -287,7 +244,7 @@ func (s *TokenSource) ExpiresAt() time.Time {
 }
 
 // usable reports whether t can be handed out now. The caller holds s.mu.
-func (s *TokenSource) usable(t Token) bool {
+func (s *TokenSource) usable(t cachedToken) bool {
 	return t.AccessToken != "" &&
 		t.AccessToken != s.revoked &&
 		s.now().Add(s.renewMargin(t)).Before(t.ExpiresAt)
@@ -295,7 +252,7 @@ func (s *TokenSource) usable(t Token) bool {
 
 // renewMargin is how long before expiry t is replaced: refreshBefore, or half
 // the token's lifetime when that is shorter.
-func (s *TokenSource) renewMargin(t Token) time.Duration {
+func (s *TokenSource) renewMargin(t cachedToken) time.Duration {
 	m := s.refreshBefore
 	if !t.IssuedAt.IsZero() {
 		if half := t.ExpiresAt.Sub(t.IssuedAt) / 2; half >= 0 && half < m {
@@ -305,56 +262,39 @@ func (s *TokenSource) renewMargin(t Token) time.Duration {
 	return m
 }
 
-// matches reports whether a stored token was produced by this key and host.
-func (s *TokenSource) matches(t Token) bool {
-	return t.KeySalt != "" && t.KeyFingerprint == s.fingerprint(t.KeySalt)
-}
-
-func (s *TokenSource) fingerprint(salt string) string {
-	sum := sha256.Sum256([]byte(salt + "\x00" + s.baseURL + "\x00" + s.apiKey))
-	return hex.EncodeToString(sum[:])
-}
-
-func newSalt() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b) // crypto/rand.Read never fails on supported platforms
-	return hex.EncodeToString(b)
-}
-
-func (s *TokenSource) exchange(ctx context.Context) (Token, error) {
+func (s *TokenSource) exchange(ctx context.Context) (cachedToken, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+tokenPath, nil)
 	if err != nil {
-		return Token{}, fmt.Errorf("auth: building request: %w", err)
+		return cachedToken{}, fmt.Errorf("auth: building request: %w", err)
 	}
 	req.Header.Set("Authorization", "ApiKey "+s.apiKey)
 	req.Header.Set("Accept", "*/*")
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return Token{}, fmt.Errorf("auth: token exchange: %w", err)
+		return cachedToken{}, fmt.Errorf("auth: token exchange: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
-		return Token{}, fmt.Errorf("auth: reading token response: %w", err)
+		return cachedToken{}, fmt.Errorf("auth: reading token response: %w", err)
 	}
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return Token{}, fmt.Errorf("%w (HTTP %d)", ErrInvalidKey, resp.StatusCode)
+		return cachedToken{}, fmt.Errorf("%w (HTTP %d)", ErrInvalidKey, resp.StatusCode)
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		// The body is deliberately omitted: it is not needed to diagnose a
 		// status code and we never want credential-adjacent text in logs.
-		return Token{}, fmt.Errorf("auth: token exchange failed: HTTP %d", resp.StatusCode)
+		return cachedToken{}, fmt.Errorf("auth: token exchange failed: HTTP %d", resp.StatusCode)
 	}
 
 	raw := strings.TrimSpace(string(body))
 	exp, err := jwtExpiry(raw)
 	if err != nil {
-		return Token{}, err
+		return cachedToken{}, err
 	}
-	salt := newSalt()
-	return Token{AccessToken: raw, ExpiresAt: exp, IssuedAt: s.now(), KeyFingerprint: s.fingerprint(salt), KeySalt: salt}, nil
+	return cachedToken{AccessToken: raw, ExpiresAt: exp, IssuedAt: s.now()}, nil
 }
 
 // jwtExpiry reads the "exp" claim from a JWT without verifying its signature.

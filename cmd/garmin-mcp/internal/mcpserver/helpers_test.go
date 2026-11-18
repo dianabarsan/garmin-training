@@ -17,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	garminconnect "github.com/dianabarsan/garmin-training/garmin-connect"
+	"github.com/dianabarsan/garmin-training/garmin-connect/auth"
 )
 
 const (
@@ -89,12 +90,6 @@ func (f *fakeGarmin) query(path string) string {
 	return f.queries[path]
 }
 
-func (f *fakeGarmin) exchangeCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.exchanges
-}
-
 // recordingLog captures everything logged, so tests can prove no secret leaks.
 type recordingLog struct {
 	mu  sync.Mutex
@@ -121,23 +116,28 @@ func (r *recordingLog) String() string {
 
 // harness wires a Server to a fake Garmin.
 type harness struct {
-	fg    *fakeGarmin
-	creds *Credentials
-	srv   *Server
-	log   *recordingLog
+	fg  *fakeGarmin
+	srv *Server
+	log *recordingLog
 }
 
 type harnessOpt func(*Config)
 
 func newHarness(t *testing.T, opts ...harnessOpt) *harness {
 	t.Helper()
+	return newHarnessWithKey(t, validKey, opts...)
+}
+
+// newHarnessWithKey is newHarness with the server holding key, which the fake
+// Garmin rejects unless it is validKey.
+func newHarnessWithKey(t *testing.T, key string, opts ...harnessOpt) *harness {
+	t.Helper()
 	h := &harness{fg: newFakeGarmin(t), log: &recordingLog{}}
-	h.creds = NewCredentials(WithAuthBaseURL(h.fg.srv.URL))
+	tokens := auth.NewTokenSource(key, auth.WithBaseURL(h.fg.srv.URL))
 	cfg := Config{
-		API:         garminconnect.New(garminconnect.WithBaseURL(h.fg.srv.URL), garminconnect.WithTokenSource(h.creds), garminconnect.WithRetry(0, 0, 0)),
-		Credentials: h.creds,
-		Logger:      h.log.logger(),
-		Now:         func() time.Time { return fixedNow },
+		API:    garminconnect.New(garminconnect.WithBaseURL(h.fg.srv.URL), garminconnect.WithTokenSource(tokens), garminconnect.WithRetry(0, 0, 0)),
+		Logger: h.log.logger(),
+		Now:    func() time.Time { return fixedNow },
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -148,13 +148,6 @@ func newHarness(t *testing.T, opts ...harnessOpt) *harness {
 	}
 	h.srv = srv
 	return h
-}
-
-func (h *harness) authenticate(t *testing.T) {
-	t.Helper()
-	if err := h.creds.Set(context.Background(), validKey); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // connect opens an in-memory MCP client session.

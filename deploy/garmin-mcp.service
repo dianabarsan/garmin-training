@@ -2,6 +2,7 @@
 # See docs/running-locally.md for the steps.
 #
 #   mkdir -p -m 700 ~/.config/garmin-mcp ~/.config/systemd/user
+#   read -rs KEY && printf '%s\n' "$KEY" | garmin-mcp -set-key -key-store ~/.config/garmin-mcp/key; unset KEY
 #   cp deploy/garmin-mcp.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now garmin-mcp
 
@@ -16,14 +17,14 @@ ExecStart=%h/.local/bin/garmin-mcp -key-store %h/.config/garmin-mcp/key
 
 # Optional settings, one KEY=value per line (keep the file private, chmod 600):
 #   GARMIN_MCP_TOKEN=...          require a bearer token
-#   GARMIN_MCP_ALLOWED_HOSTS=...  public hostname when reached through a tunnel
 # The leading "-" means the file may be absent.
 EnvironmentFile=-%h/.config/garmin-mcp/env
 
 Restart=on-failure
 RestartSec=5
 
-# The server only needs to read its binary and write its key file.
+# The server only needs to read its binary and key file, and write an audit
+# file there if -audit-log is added.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

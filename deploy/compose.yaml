@@ -19,12 +19,9 @@ services:
       GARMIN_MCP_TOKEN_FILE: /run/secrets/mcp_token
       GARMIN_PERSONAL_API_KEY_FILE: /run/secrets/garmin_key
     secrets: [mcp_token, garmin_key]
+    # Holds the audit file if -audit-log /data/audit.log is added to the command.
     volumes:
       - garmin-data:/data
-    # Reachable only from the server itself (for example through an SSH tunnel),
-    # never from the internet. Used to replace the Garmin key.
-    ports:
-      - "127.0.0.1:${ADMIN_PORT:-8808}:8808"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

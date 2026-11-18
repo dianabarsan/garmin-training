@@ -6,8 +6,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +29,16 @@ type syncBuf struct {
 
 func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
 func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
+func noEnv(string) string { return "" }
+
+// keyEnv is an environment holding only a valid API key.
+func keyEnv(k string) string {
+	if k == "GARMIN_PERSONAL_API_KEY" {
+		return goodKey
+	}
+	return ""
+}
 
 func fakeGarmin(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
@@ -61,8 +73,16 @@ func start(t *testing.T, env map[string]string, args ...string) (base string, lo
 	ready := make(chan string, 1)
 	done := make(chan error, 1)
 	all := append([]string{"-addr", "127.0.0.1:0"}, args...)
+	// The server needs a key to start: give it one unless the test does.
+	if env["GARMIN_PERSONAL_API_KEY"] == "" && env["GARMIN_PERSONAL_API_KEY_FILE"] == "" && !slices.Contains(args, "-key-store") {
+		env = maps.Clone(env)
+		if env == nil {
+			env = map[string]string{}
+		}
+		env["GARMIN_PERSONAL_API_KEY"] = goodKey
+	}
 	go func() {
-		done <- run(ctx, all, func(k string) string { return env[k] }, io.Discard, logs, func(a string) { ready <- a })
+		done <- run(ctx, all, func(k string) string { return env[k] }, nil, io.Discard, logs, func(a string) { ready <- a })
 	}()
 	select {
 	case addr := <-ready:

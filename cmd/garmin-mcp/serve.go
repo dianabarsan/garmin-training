@@ -23,7 +23,7 @@ func serve(ctx context.Context, ln net.Listener, handler http.Handler) error {
 		IdleTimeout:       2 * time.Minute,
 		BaseContext:       func(net.Listener) context.Context { return connCtx },
 		// No ReadTimeout or WriteTimeout: MCP requests and responses can be
-		// long-lived event streams. /auth sets its own body-read deadline.
+		// long-lived event streams.
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.Serve(ln) }()

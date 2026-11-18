@@ -148,7 +148,7 @@ func TestRun_AuditLogFile(t *testing.T) {
 
 	session := func() {
 		base, logs, stop := start(t, env, "-garmin-url", garminSrv.URL, "-audit-log", path)
-		get(t, base+"/auth", nil) // refused: no token
+		get(t, base+"/mcp", nil) // refused: no token
 		hc := &http.Client{Transport: headerTransport{"Authorization": "Bearer " + token}}
 		cs, err := mcp.NewClient(&mcp.Implementation{Name: "audit-test", Version: "1"}, nil).
 			Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: base + "/mcp", HTTPClient: hc}, nil)
@@ -183,7 +183,7 @@ func TestRun_AuditLogFile(t *testing.T) {
 	for _, m := range first {
 		switch m["msg"] {
 		case "access_denied":
-			if m["reason"] == "missing_token" && m["path"] == "/auth" {
+			if m["reason"] == "missing_token" && m["path"] == "/mcp" {
 				denied++
 			}
 		case "tool_call":
@@ -239,14 +239,14 @@ func TestRun_UnusableAuditLogPathFailsAtStartup(t *testing.T) {
 	garminSrv, _ := fakeGarmin(t)
 	env := func(string) string { return "" }
 	// A directory cannot be opened for appending.
-	err := run(context.Background(), []string{"-addr", "127.0.0.1:0", "-garmin-url", garminSrv.URL, "-audit-log", t.TempDir()}, env, io.Discard, io.Discard, nil)
+	err := run(context.Background(), []string{"-addr", "127.0.0.1:0", "-garmin-url", garminSrv.URL, "-audit-log", t.TempDir()}, env, nil, io.Discard, io.Discard, nil)
 	if err == nil || !strings.Contains(err.Error(), "-audit-log") {
 		t.Errorf("err = %v, want a clear -audit-log error", err)
 	}
 	// So can a path below a regular file.
 	file := filepath.Join(t.TempDir(), "plain")
 	_ = os.WriteFile(file, nil, 0o600)
-	err = run(context.Background(), []string{"-addr", "127.0.0.1:0", "-garmin-url", garminSrv.URL, "-audit-log", filepath.Join(file, "audit.log")}, env, io.Discard, io.Discard, nil)
+	err = run(context.Background(), []string{"-addr", "127.0.0.1:0", "-garmin-url", garminSrv.URL, "-audit-log", filepath.Join(file, "audit.log")}, env, nil, io.Discard, io.Discard, nil)
 	if err == nil || !strings.Contains(err.Error(), "-audit-log") {
 		t.Errorf("err = %v", err)
 	}

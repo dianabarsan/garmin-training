@@ -62,9 +62,9 @@ cd garmin-training
 ./setup.sh
 ```
 
-The script builds the image, starts the server, prompts for your Garmin API key (input is
-hidden) and validates it with Garmin. If Claude Code is installed, it offers to register
-the connector; otherwise it prints the command to do so.
+The script builds the image, prompts for your Garmin API key (input is hidden), checks it
+with Garmin, stores it, and starts the server. If Claude Code is installed, it offers to
+register the connector; otherwise it prints the command to do so.
 
 Resulting configuration:
 
@@ -90,7 +90,6 @@ to the last 7 days and accept ranges of up to 366 days.
 
 | Tool | What it returns |
 |---|---|
-| `auth_status` | Whether a key has been provided. |
 | `list_activities` | Activities with distance, duration, heart rate, elevation, training effect, HR-zone time and, for strength sessions, the per-exercise breakdown. Filters: dates, type, sub-type, text, distance/duration, sort, paging. |
 | `get_activity` | One activity's summary. |
 | `get_activity_splits` | Per-km (or per-mile) splits computed from the per-second data. |
@@ -105,8 +104,8 @@ to the last 7 days and accept ranges of up to 366 days.
 
 Laps and individual strength sets are not available through the Personal API.
 
-If a tool is called before an API key has been provided, it returns an error instructing
-the assistant to request one from the user; the assistant cannot supply the key itself.
+If Garmin rejects the key (for example because it expired), every tool returns an error
+telling the assistant to ask you to replace it; the assistant cannot do that itself.
 
 ### Raw data, location and response size
 
@@ -134,10 +133,8 @@ The server handles health data and a Garmin credential, and is restrictive by de
 
 - It binds to loopback and **refuses to start on any other address unless an access token
   is configured**; every client must then present the token.
-- For deployments reachable from other machines, `-disable-auth-endpoint` removes the
-  key-entry endpoint entirely, so a leaked token cannot be used to replace the key. The
-  Fly.io guide enables it; in the self-hosted setup the endpoint is hidden from the
-  internet by Caddy, and the guide describes how to remove it entirely.
+- The key is given to the server only when it starts, from the environment or a key file.
+  There is no endpoint for it, so a leaked access token can neither read nor replace it.
 - The API key and the bearer token are never returned by any endpoint or tool, never
   logged, and never included in error messages or the `-h` output. Tests check this.
 - An **audit log** records every tool call and refused request (operation, client and time)
@@ -150,41 +147,37 @@ Full details: [Security model](#security-model).
 
 ### Providing the key
 
+The server needs a key to start, and reads it once, at startup:
+
 | How | Command |
 |---|---|
-| Browser form | open <http://127.0.0.1:8808/> and paste the key |
-| HTTP endpoint | `printf '{"api_key":"%s"}' "$KEY" \| curl -H 'Content-Type: application/json' -d @- http://127.0.0.1:8808/auth` |
-| Environment | `GARMIN_PERSONAL_API_KEY=... go run ./cmd/garmin-mcp` |
+| Key file (what `setup.sh` does) | `garmin-mcp -set-key -key-store FILE` reads the key from standard input, checks it with Garmin and saves it; then run `garmin-mcp -key-store FILE` |
+| Environment | `GARMIN_PERSONAL_API_KEY=... garmin-mcp`, or `GARMIN_PERSONAL_API_KEY_FILE` naming a file that holds it |
 
-The key stays in memory. To survive restarts, pass `-key-store path`: the file is
-written with mode `0600` (and its directory, if the server creates it, `0700`). An
-existing file that other users can read is changed to `0600` at startup, with a warning.
-`DELETE /auth` removes it.
+The environment wins over the key file. `-set-key` saves a key only if Garmin accepts it;
+the file is written with mode `0600` (and its directory, if created, `0700`), and an
+existing key file that other users can read is changed to `0600` at startup, with a
+warning.
 
-If Garmin cannot be reached when the server starts, a key from `GARMIN_PERSONAL_API_KEY`
-is used anyway and checked on the first request; only a key Garmin actually rejects is
-discarded.
-
-### The `/auth` endpoint
-
-| Request | Effect |
-|---|---|
-| `POST /auth` `{"api_key": "..."}` (JSON, or the form on `/`) | Checks the key with Garmin; if accepted it becomes the active key. A rejected key changes nothing. `401` means Garmin refused it; `413` means the body exceeded 4 KiB. |
-| `GET /auth` | `{"authenticated": bool, "token_expires_at": ..., "persisted": bool}`. Never returns the key. |
-| `DELETE /auth` | Forgets the key (and deletes the stored copy, if any). |
+Shortly after starting, the server checks the key with Garmin and logs the result. A
+rejected key is not fatal: the server keeps running and every tool says the key must be
+replaced. To replace it, save a new one and restart the server (`./setup.sh --new-key`
+does both). If Garmin cannot be reached at startup, the key is checked again on the first
+request.
 
 ### Flags
 
 | Flag / environment | Meaning |
 |---|---|
 | `-addr` (default `127.0.0.1:8808`) | Address to listen on. |
-| `-token` / `GARMIN_MCP_TOKEN` | Require `Authorization: Bearer <token>` on `/mcp` and `/auth`. At least 16 characters (`openssl rand -hex 32`). Prefer the environment variable or `GARMIN_MCP_TOKEN_FILE`: a value on the command line is visible in the process list. |
+| `GARMIN_MCP_TOKEN` | Require `Authorization: Bearer <token>` on `/mcp`. At least 16 characters (`openssl rand -hex 32`). There is deliberately no command-line flag for it, where it would be visible in the process list. |
 | `-allowed-host` / `GARMIN_MCP_ALLOWED_HOSTS` | Public hostname(s), comma separated, that the server may be reached as. Set it behind a reverse proxy; other `Host` values are refused. On Fly.io, `<FLY_APP_NAME>.fly.dev` is added automatically. |
-| `-disable-auth-endpoint` / `GARMIN_MCP_DISABLE_AUTH_ENDPOINT` | Serve no `/auth` or key page (both answer 404), so a leaked token can never replace the key. The key must then come from `GARMIN_PERSONAL_API_KEY[_FILE]` or an existing `-key-store`; the server refuses to start without one. Use it whenever the server is reachable from outside. |
 | `-audit-log` / `GARMIN_MCP_AUDIT_LOG` | Append the audit trail (see below) to this file as JSON lines, mode `0600`. Without it the records appear in the normal log, tagged `audit=true`. |
 | `-audit-log-max-mb` (default `10`) | When the audit file would grow past this size it is renamed to `<file>.1`, replacing an older one, and a new file is started. `0` disables the limit; the most allowed is `1048576` (1 TiB). |
-| `-key-store` / `GARMIN_MCP_KEY_STORE` | Persist the key in this file. |
-| `GARMIN_PERSONAL_API_KEY` | Key to use at startup (wins over the key store). |
+| `-key-store` / `GARMIN_MCP_KEY_STORE` | File holding the key, written by `-set-key`. |
+| `-set-key` | Read a key from standard input, check it with Garmin, save it to `-key-store` and exit. |
+| `-key-stored` | Exit 0 if `-key-store` holds a key, 1 if not. The key is not printed or checked. |
+| `GARMIN_PERSONAL_API_KEY` | Key to use (wins over the key store). |
 | `GARMIN_MCP_TOKEN_FILE`, `GARMIN_PERSONAL_API_KEY_FILE` | Read the token / key from a file instead (Docker secrets). Setting both forms of one is an error, and so is an empty file, so a failed secret mount never starts the server without a token. |
 | `-healthcheck` | Probe a running server at `-addr` and exit 0 if healthy (container health checks). |
 | `-log-level` | `debug`, `info`, `warn`, `error`. |
@@ -198,16 +191,13 @@ By default the server is built for a single user on one machine:
   `localhost`, `127.0.0.1` or `::1` (DNS-rebinding defence), except `/healthz`, which only answers `ok`.
 - State-changing requests carrying a foreign `Origin` or a cross-site `Sec-Fetch-Site`
   are refused (browser CSRF defence).
-- It **refuses to start on a non-loopback address without `-token`**.
-- `-disable-auth-endpoint` removes `/auth` and the key page entirely, even for a request
-  that carries the token. Use it when the server is exposed through a tunnel or proxy.
-- When `-token` is set the browser form at `/` is not served (a form cannot send the
-  bearer header); use the JSON endpoint.
-- The key is never returned by any endpoint or tool, never logged, and never part of an
-  error message. Tests check this.
+- It **refuses to start on a non-loopback address without a token** (`GARMIN_MCP_TOKEN`).
+- It has no endpoint for the key: the key is read at startup, from the environment or the
+  key file, so nothing reachable over HTTP can read or replace it.
+- The key is never returned by any tool, never logged, and never part of an error
+  message. Tests check this.
 - The bearer token is compared in constant time; the `Bearer` scheme is matched without
-  regard to case. Request headers are limited to 64 KiB, and the `/auth` body to 4 KiB,
-  read within 10 seconds.
+  regard to case. Request headers are limited to 64 KiB.
 - If you expose it beyond localhost, put it behind TLS (a reverse proxy); the server
   speaks plain HTTP. [`docs/fly.md`](docs/fly.md) and [`deploy/README.md`](deploy/README.md)
   both give you HTTPS.
@@ -222,9 +212,7 @@ read if a token ever leaks.
 | `tool_call` | A tool was called | `tool`, `args`, `outcome` (`ok` or `error`), `error`, `duration_ms`, `result_bytes`, `client`, `session` |
 | `client_connected` | A client finished the MCP handshake over HTTP | `client`, `session` |
 | `access_denied` | A request was refused | `reason` (`missing_token`, `invalid_token`, `forbidden_host`, `cross_origin`), `method`, `path`, `remote`, `forwarded_for`, `user_agent`, plus the `host` or `origin` that was rejected, and `previously_unrecorded` after throttling (below) |
-| `access_denied_throttled` | One address was refused more than 20 times in a minute; its further refusals in that minute are counted, not recorded | `remote`, `forwarded_for`, `recorded`, `resumes_at` |
-| `access_denied_unrecorded` | Throttled addresses were dropped from the throttle's table (it tracks 1,024 at a time) before they could report their counts | `sources`, `previously_unrecorded` |
-| `key_set`, `key_rejected`, `key_set_failed`, `key_cleared` | The Garmin key was provided, refused, failed to validate, or removed at `/auth` | `remote`, `forwarded_for` |
+| `access_denied_throttled` | More than 100 requests were refused in a minute; further refusals in that minute are counted, not recorded | `remote`, `forwarded_for` (of the request that hit the limit), `recorded`, `resumes_at` |
 
 Records go into the normal log tagged `audit=true`, or, with `-audit-log path`, into a
 separate append-only file of JSON lines (mode `0600`), which is rotated to `<file>.1` at
@@ -243,7 +231,6 @@ jq -c 'select(.msg=="tool_call") | {time, tool, args, client}' audit.log
 | Local, [`setup.sh`](#local-setup) | `/data/audit.log` in the Docker volume (JSON lines), and `/data/audit.log.1` after rotation | `./setup.sh --audit-log` (prints both, oldest first) |
 | Local, `go run` or installed command | The server's standard error, or the file passed to `-audit-log` | Read the terminal output, or `jq -c . <file>` |
 | Local, systemd ([guide](docs/running-locally.md), section 5) | The user journal, or the file passed to `-audit-log` | `journalctl --user -u garmin-mcp \| grep audit=true` |
-| Local, manual `docker run` ([guide](docs/running-locally.md), section 6) | The container log; cleared when the container is removed | `docker logs garmin-mcp 2>&1 \| grep audit=true` |
 | Fly.io ([guide](docs/fly.md)) | Fly's log stream; only a recent window is available | `fly logs -a "$APP" --no-tail \| grep audit=true` (omit `--no-tail` to follow live) |
 | Self-hosted server ([guide](deploy/README.md)) | The container log, or a file if configured | `docker compose logs garmin-mcp \| grep audit=true`, run in `deploy/` |
 
@@ -264,10 +251,11 @@ calls without exposing an identifier that could be replayed.
 - It is a plain file, not tamper-evident against someone who can write to it. Rotation
   keeps one previous file, so at most about twice the size limit is kept; copy older
   records elsewhere if you need a longer history.
-- Refusals are throttled per address (20 records a minute, then one
-  `access_denied_throttled` record), so a flood of bad requests cannot fill the disk or
-  bury the tool calls. Behind a proxy all requests share the proxy's address, and so share
-  that budget.
+- Refusals are throttled (100 records a minute, from all addresses together, then one
+  `access_denied_throttled` record), so a flood of bad requests cannot fill the disk.
+  Tool calls are never throttled. During a flood, refusals from other addresses in that
+  minute are counted but not recorded; the next record after it gives the count as
+  `previously_unrecorded`.
 - A `tool_call` is written when the call finishes, so a call that never returns leaves no
   record.
 - `client_connected` is only emitted for HTTP clients, which is how real clients connect.

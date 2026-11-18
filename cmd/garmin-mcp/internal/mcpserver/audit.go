@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -94,133 +93,62 @@ func remoteAttrs(r *http.Request) []slog.Attr {
 	return attrs
 }
 
-// Refused requests are recorded at most deniedBurst times per remote address
-// in each deniedWindow, so anyone who can reach the port cannot flood the audit
-// log (and the disk) with refusals or bury the tool calls among them.
+// Refused requests are recorded at most deniedBurst times in each
+// deniedWindow, all sources together, so anyone who can reach the port cannot
+// flood the audit log (and the disk) with refusals. Tool calls are not
+// throttled, so refusals cannot bury them.
 const (
-	deniedBurst      = 20
-	deniedWindow     = time.Minute
-	deniedMaxSources = 1024 // addresses tracked at once; the rest share one budget
+	deniedBurst  = 100
+	deniedWindow = time.Minute
 )
 
-// denyAuditor records refused requests, throttled per remote address. When an
-// address exceeds its budget, one access_denied_throttled record says so; the
-// number of refusals left out is reported in the next record for that address
-// after the window ends.
+// denyAuditor records refused requests, throttled. When the budget is used
+// up, one access_denied_throttled record says so; the number of refusals left
+// out is reported in the first record after the window ends.
 type denyAuditor struct {
 	log *slog.Logger
 	now func() time.Time
 
-	mu        sync.Mutex
-	sources   map[string]*denySource
-	nextSweep time.Time // when a full map next has an expired entry to drop
-}
-
-type denySource struct {
-	start      time.Time
-	count      int // refusals recorded in this window
-	suppressed int // refusals left out in this window
+	mu         sync.Mutex
+	start      time.Time // when the current window began
+	count      int       // refusals in this window
+	suppressed int       // refusals left out in this window
 }
 
 func newDenyAuditor(log *slog.Logger, now func() time.Time) *denyAuditor {
-	return &denyAuditor{log: log, now: now, sources: map[string]*denySource{}}
+	return &denyAuditor{log: log, now: now}
 }
 
-// record logs a refused request, unless its source has used up its budget.
+// record logs a refused request, unless the budget is used up.
 func (d *denyAuditor) record(r *http.Request, reason string, extra ...slog.Attr) {
-	src := r.RemoteAddr
-	if h, _, err := net.SplitHostPort(src); err == nil {
-		src = h
-	}
 	now := d.now()
-
 	d.mu.Lock()
-	s, evicted := d.source(src, now)
 	var missed int
-	if now.Sub(s.start) >= deniedWindow {
-		missed = s.suppressed
-		*s = denySource{start: now}
+	if now.Sub(d.start) >= deniedWindow {
+		missed = d.suppressed
+		d.start, d.count, d.suppressed = now, 0, 0
 	}
-	s.count++
-	verdict := verdictLog
-	switch {
-	case s.count == deniedBurst+1:
-		verdict = verdictThrottle
-		s.suppressed++
-	case s.count > deniedBurst+1:
-		verdict = verdictDrop
-		s.suppressed++
+	d.count++
+	if d.count > deniedBurst {
+		d.suppressed++
 	}
-	until := s.start.Add(deniedWindow)
+	count, until := d.count, d.start.Add(deniedWindow)
 	d.mu.Unlock()
 
 	ctx := r.Context()
-	if evicted.sources > 0 {
-		d.log.LogAttrs(ctx, slog.LevelWarn, "access_denied_unrecorded",
-			slog.Int("sources", evicted.sources), slog.Int("previously_unrecorded", evicted.count))
-	}
-	switch verdict {
-	case verdictLog:
+	switch {
+	case count <= deniedBurst:
 		attrs := deniedAttrs(r, reason, extra...)
 		if missed > 0 {
 			attrs = append(attrs, slog.Int("previously_unrecorded", missed))
 		}
 		d.log.LogAttrs(ctx, slog.LevelWarn, "access_denied", attrs...)
-	case verdictThrottle:
+	case count == deniedBurst+1:
 		attrs := append(remoteAttrs(r),
 			slog.Int("recorded", deniedBurst),
 			slog.Time("resumes_at", until.UTC()))
 		d.log.LogAttrs(ctx, slog.LevelWarn, "access_denied_throttled", attrs...)
 	}
-}
-
-// denyVerdict is what record does with one refusal.
-type denyVerdict int
-
-const (
-	verdictLog      denyVerdict = iota // within budget: record it
-	verdictThrottle                    // first one over budget: say records stop
-	verdictDrop                        // over budget: count it only
-)
-
-// evictedCounts totals the refusals left unrecorded by sources dropped from
-// the map before they could report them.
-type evictedCounts struct{ sources, count int }
-
-// source returns the counters for src, creating them. The map is bounded:
-// when it is full, entries whose window has ended are dropped (at most once
-// per window, so a full map is not scanned on every request), and if it is
-// still full, new sources share one entry. The refusals the dropped entries
-// had left out are returned, to be reported in one record.
-func (d *denyAuditor) source(src string, now time.Time) (*denySource, evictedCounts) {
-	var ev evictedCounts
-	if s, ok := d.sources[src]; ok {
-		return s, ev
-	}
-	if len(d.sources) >= deniedMaxSources && !now.Before(d.nextSweep) {
-		oldest := now
-		for k, s := range d.sources {
-			if now.Sub(s.start) >= deniedWindow {
-				if s.suppressed > 0 {
-					ev.sources++
-					ev.count += s.suppressed
-				}
-				delete(d.sources, k)
-			} else if s.start.Before(oldest) {
-				oldest = s.start
-			}
-		}
-		d.nextSweep = oldest.Add(deniedWindow)
-	}
-	if len(d.sources) >= deniedMaxSources {
-		src = "(other)"
-		if s, ok := d.sources[src]; ok {
-			return s, ev
-		}
-	}
-	s := &denySource{start: now}
-	d.sources[src] = s
-	return s, ev
 }
 
 // auditMiddleware records every tool call, for all tools at once, without each
