@@ -1,10 +1,12 @@
 package garminconnect_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -230,5 +232,271 @@ func TestClient_DoesNotMutateCallerHTTPClient(t *testing.T) {
 	_ = garminconnect.New(garminconnect.WithHTTPClient(hc), garminconnect.WithTokenSource(staticToken("t")))
 	if hc.Transport != nil {
 		t.Error("caller's http.Client.Transport was modified")
+	}
+}
+
+func TestClient_ResponseSizeIsLimited(t *testing.T) {
+	t.Parallel()
+	big := `{"pad":"` + strings.Repeat("x", 5000) + `"}`
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(big))
+	}), garminconnect.WithMaxResponseBytes(1000))
+	if _, err := c.UserSettings(context.Background()); !errors.Is(err, garminconnect.ErrResponseTooLarge) {
+		t.Errorf("err = %v, want ErrResponseTooLarge", err)
+	}
+	// The same response within the limit is fine.
+	c = newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(big))
+	}), garminconnect.WithMaxResponseBytes(10000))
+	if _, err := c.UserSettings(context.Background()); err != nil {
+		t.Errorf("within the limit: %v", err)
+	}
+}
+
+func TestClient_TrailingDataIsAnError(t *testing.T) {
+	t.Parallel()
+	c, _ := serve(t, `{"a":1} {"b":2}`)
+	if _, err := c.UserSettings(context.Background()); err == nil {
+		t.Error("a body with two JSON values must be rejected")
+	}
+}
+
+// rotatingToken hands out tok-1 until it is invalidated, then tok-2.
+type rotatingToken struct {
+	mu          sync.Mutex
+	invalidated []string
+}
+
+func (r *rotatingToken) AccessToken(context.Context) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.invalidated) == 0 {
+		return "tok-1", nil
+	}
+	return "tok-2", nil
+}
+
+func (r *rotatingToken) Invalidate(tok string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.invalidated = append(r.invalidated, tok)
+}
+
+func TestClient_RevokedTokenIsReplacedOnce(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	accept := "Bearer tok-2"
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") != accept {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	ts := &rotatingToken{}
+	c := newTestClient(t, h, garminconnect.WithTokenSource(ts))
+	if _, err := c.UserSettings(context.Background()); err != nil {
+		t.Fatalf("a revoked token should be replaced: %v", err)
+	}
+	if calls.Load() != 2 || len(ts.invalidated) != 1 || ts.invalidated[0] != "tok-1" {
+		t.Errorf("calls=%d invalidated=%v", calls.Load(), ts.invalidated)
+	}
+
+	// Refused again, and the source keeps handing out the same token: the 401
+	// is returned without resending a request that would fail the same way.
+	calls.Store(0)
+	accept = "never"
+	if _, err := c.UserSettings(context.Background()); !errors.Is(err, garminconnect.ErrUnauthorized) || calls.Load() != 1 {
+		t.Errorf("err=%v calls=%d, want ErrUnauthorized after 1", err, calls.Load())
+	}
+
+	// A token source that cannot invalidate gets the 401 straight away.
+	var plain atomic.Int32
+	c = newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plain.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	if _, err := c.UserSettings(context.Background()); !errors.Is(err, garminconnect.ErrUnauthorized) || plain.Load() != 1 {
+		t.Errorf("err=%v calls=%d, want ErrUnauthorized after 1", err, plain.Load())
+	}
+}
+
+// Requests refused together with the same revoked token invalidate it once
+// and all retry with its replacement.
+func TestClient_ConcurrentRefusalsShareOneReplacement(t *testing.T) {
+	t.Parallel()
+	const n = 8
+	var refused sync.WaitGroup
+	refused.Add(n)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer tok-1" {
+			refused.Done()
+			refused.Wait() // every request holds tok-1 before any is refused
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	ts := &rotatingToken{}
+	c := newTestClient(t, h, garminconnect.WithTokenSource(ts))
+	errs := make(chan error, n)
+	for range n {
+		go func() {
+			_, err := c.UserSettings(context.Background())
+			errs <- err
+		}()
+	}
+	for range n {
+		if err := <-errs; err != nil {
+			t.Errorf("a request refused with the revoked token failed: %v", err)
+		}
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if len(ts.invalidated) != 1 {
+		t.Errorf("invalidated %v, want tok-1 once", ts.invalidated)
+	}
+}
+
+func TestClient_RefusesPlainHTTPToARemoteHost(t *testing.T) {
+	t.Parallel()
+	c := garminconnect.New(garminconnect.WithBaseURL("http://example.com"), garminconnect.WithTokenSource(staticToken("tok")))
+	if _, err := c.UserSettings(context.Background()); !errors.Is(err, garminconnect.ErrInsecureBaseURL) {
+		t.Errorf("err = %v, want ErrInsecureBaseURL", err)
+	}
+}
+
+func TestClient_MoreSentinels(t *testing.T) {
+	t.Parallel()
+	for code, want := range map[int]error{
+		400: garminconnect.ErrBadRequest,
+		500: garminconnect.ErrServer,
+		503: garminconnect.ErrServer,
+		501: garminconnect.ErrServer,
+	} {
+		c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+		}), garminconnect.WithRetry(0, 0, 0))
+		_, err := c.UserSettings(context.Background())
+		var apiErr *garminconnect.APIError
+		if !errors.Is(err, want) || !errors.As(err, &apiErr) || apiErr.StatusCode != code {
+			t.Errorf("%d: err = %v, want %v", code, err, want)
+		}
+	}
+}
+
+func TestClient_AttemptTimeout(t *testing.T) {
+	t.Parallel()
+	hang := func() http.Handler {
+		var calls atomic.Int32
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				select {
+				case <-r.Context().Done():
+				case <-time.After(5 * time.Second):
+				}
+				return
+			}
+			_, _ = w.Write([]byte(`{}`))
+		})
+	}
+	c := newTestClient(t, hang(), garminconnect.WithAttemptTimeout(100*time.Millisecond))
+	if _, err := c.UserSettings(context.Background()); err != nil {
+		t.Errorf("a hung attempt should be retried: %v", err)
+	}
+	c = newTestClient(t, hang(), garminconnect.WithAttemptTimeout(100*time.Millisecond), garminconnect.WithRetry(0, 0, 0))
+	if _, err := c.UserSettings(context.Background()); !errors.Is(err, garminconnect.ErrAttemptTimeout) {
+		t.Errorf("without retries: err = %v, want ErrAttemptTimeout", err)
+	}
+}
+
+func TestNew_IgnoresNilOptions(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}), nil)
+	if _, err := c.UserSettings(context.Background()); err != nil {
+		t.Error(err)
+	}
+	if _, err := (&garminconnect.Client{}).UserSettings(context.Background()); !errors.Is(err, garminconnect.ErrNoTokenSource) {
+		t.Errorf("zero Client: err = %v, want ErrNoTokenSource", err)
+	}
+}
+
+// stallingHandler sends the start of a body and then stops on its first call,
+// and serves body in full afterwards.
+func stallingHandler(body string, calls *atomic.Int32) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(body[:len(body)/2]))
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	})
+}
+
+func TestClient_StalledBodyIsRequestedAgain(t *testing.T) {
+	t.Parallel()
+	const body = `[{"calendarDate":"2026-11-01","totalSteps":5,"stepGoal":7000}]`
+	var calls atomic.Int32
+	c := newTestClient(t, stallingHandler(body, &calls), garminconnect.WithAttemptTimeout(100*time.Millisecond))
+	days, err := c.Steps(context.Background(), day("2026-11-01"), day("2026-11-01"))
+	if err != nil || len(days) != 1 || days[0].TotalSteps != 5 || days[0].StepGoal != 7000 {
+		t.Fatalf("days=%+v err=%v", days, err)
+	}
+	if calls.Load() != 2 {
+		t.Errorf("calls = %d, want 2", calls.Load())
+	}
+
+	calls.Store(0)
+	c = newTestClient(t, stallingHandler(body, &calls), garminconnect.WithAttemptTimeout(100*time.Millisecond), garminconnect.WithRetry(0, 0, 0))
+	if _, err := c.Steps(context.Background(), day("2026-11-01"), day("2026-11-01")); !errors.Is(err, garminconnect.ErrAttemptTimeout) {
+		t.Errorf("without retries: err = %v, want ErrAttemptTimeout", err)
+	}
+}
+
+func TestClient_StalledDownloadIsNotRequestedAgain(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	c := newTestClient(t, stallingHandler("0123456789abcdef", &calls), garminconnect.WithAttemptTimeout(100*time.Millisecond))
+	var buf bytes.Buffer
+	err := c.DownloadActivity(context.Background(), 1, &buf)
+	if !errors.Is(err, garminconnect.ErrAttemptTimeout) || calls.Load() != 1 {
+		t.Errorf("err = %v, calls = %d; want ErrAttemptTimeout after one call", err, calls.Load())
+	}
+}
+
+// keepingToken can be invalidated but always hands out the same token.
+type keepingToken struct{ invalidated atomic.Int32 }
+
+func (k *keepingToken) AccessToken(context.Context) (string, error) { return "tok", nil }
+func (k *keepingToken) Invalidate(string)                           { k.invalidated.Add(1) }
+
+func TestClient_401IsNotResentWithTheSameToken(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	ts := &keepingToken{}
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "nope", http.StatusUnauthorized)
+	}), garminconnect.WithTokenSource(ts))
+	_, err := c.UserSettings(context.Background())
+	var apiErr *garminconnect.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnauthorized || !strings.Contains(apiErr.Body, "nope") {
+		t.Errorf("err = %v, want Garmin's own 401", err)
+	}
+	if calls.Load() != 1 || ts.invalidated.Load() != 1 {
+		t.Errorf("calls=%d invalidated=%d, want 1 and 1", calls.Load(), ts.invalidated.Load())
+	}
+	// A second 401 within the minute does not invalidate again.
+	_, _ = c.UserSettings(context.Background())
+	if ts.invalidated.Load() != 1 {
+		t.Errorf("invalidated %d times, want once per minute", ts.invalidated.Load())
 	}
 }

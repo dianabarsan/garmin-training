@@ -31,7 +31,8 @@ const (
 	maxAuditError = 200 // bytes kept of an error message
 )
 
-// truncate shortens s to at most n bytes, never splitting a UTF-8 character.
+// truncate shortens s to at most n bytes, never splitting a UTF-8 character,
+// and marks the cut with "…", so a shortened result is up to n+3 bytes.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -110,8 +111,9 @@ type denyAuditor struct {
 	log *slog.Logger
 	now func() time.Time
 
-	mu      sync.Mutex
-	sources map[string]*denySource
+	mu        sync.Mutex
+	sources   map[string]*denySource
+	nextSweep time.Time // when a full map next has an expired entry to drop
 }
 
 type denySource struct {
@@ -133,34 +135,38 @@ func (d *denyAuditor) record(r *http.Request, reason string, extra ...slog.Attr)
 	now := d.now()
 
 	d.mu.Lock()
-	s := d.source(src, now)
+	s, evicted := d.source(src, now)
 	var missed int
 	if now.Sub(s.start) >= deniedWindow {
 		missed = s.suppressed
 		*s = denySource{start: now}
 	}
 	s.count++
-	verdict := "log"
+	verdict := verdictLog
 	switch {
 	case s.count == deniedBurst+1:
-		verdict = "throttle"
+		verdict = verdictThrottle
 		s.suppressed++
 	case s.count > deniedBurst+1:
-		verdict = "drop"
+		verdict = verdictDrop
 		s.suppressed++
 	}
 	until := s.start.Add(deniedWindow)
 	d.mu.Unlock()
 
 	ctx := r.Context()
+	if evicted.sources > 0 {
+		d.log.LogAttrs(ctx, slog.LevelWarn, "access_denied_unrecorded",
+			slog.Int("sources", evicted.sources), slog.Int("previously_unrecorded", evicted.count))
+	}
 	switch verdict {
-	case "log":
+	case verdictLog:
 		attrs := deniedAttrs(r, reason, extra...)
 		if missed > 0 {
 			attrs = append(attrs, slog.Int("previously_unrecorded", missed))
 		}
 		d.log.LogAttrs(ctx, slog.LevelWarn, "access_denied", attrs...)
-	case "throttle":
+	case verdictThrottle:
 		attrs := append(remoteAttrs(r),
 			slog.Int("recorded", deniedBurst),
 			slog.Time("resumes_at", until.UTC()))
@@ -168,29 +174,53 @@ func (d *denyAuditor) record(r *http.Request, reason string, extra ...slog.Attr)
 	}
 }
 
+// denyVerdict is what record does with one refusal.
+type denyVerdict int
+
+const (
+	verdictLog      denyVerdict = iota // within budget: record it
+	verdictThrottle                    // first one over budget: say records stop
+	verdictDrop                        // over budget: count it only
+)
+
+// evictedCounts totals the refusals left unrecorded by sources dropped from
+// the map before they could report them.
+type evictedCounts struct{ sources, count int }
+
 // source returns the counters for src, creating them. The map is bounded:
-// expired entries are dropped when it is full, and if it is still full, new
-// sources share one entry.
-func (d *denyAuditor) source(src string, now time.Time) *denySource {
+// when it is full, entries whose window has ended are dropped (at most once
+// per window, so a full map is not scanned on every request), and if it is
+// still full, new sources share one entry. The refusals the dropped entries
+// had left out are returned, to be reported in one record.
+func (d *denyAuditor) source(src string, now time.Time) (*denySource, evictedCounts) {
+	var ev evictedCounts
 	if s, ok := d.sources[src]; ok {
-		return s
+		return s, ev
 	}
-	if len(d.sources) >= deniedMaxSources {
+	if len(d.sources) >= deniedMaxSources && !now.Before(d.nextSweep) {
+		oldest := now
 		for k, s := range d.sources {
-			if now.Sub(s.start) >= deniedWindow && s.suppressed == 0 {
+			if now.Sub(s.start) >= deniedWindow {
+				if s.suppressed > 0 {
+					ev.sources++
+					ev.count += s.suppressed
+				}
 				delete(d.sources, k)
+			} else if s.start.Before(oldest) {
+				oldest = s.start
 			}
 		}
-		if len(d.sources) >= deniedMaxSources {
-			src = "(other)"
-			if s, ok := d.sources[src]; ok {
-				return s
-			}
+		d.nextSweep = oldest.Add(deniedWindow)
+	}
+	if len(d.sources) >= deniedMaxSources {
+		src = "(other)"
+		if s, ok := d.sources[src]; ok {
+			return s, ev
 		}
 	}
 	s := &denySource{start: now}
 	d.sources[src] = s
-	return s
+	return s, ev
 }
 
 // auditMiddleware records every tool call, for all tools at once, without each
@@ -198,23 +228,28 @@ func (d *denyAuditor) source(src string, now time.Time) *denySource {
 func (s *Server) auditMiddleware() mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-			switch method {
-			case "tools/call":
-				start := time.Now()
-				res, err := next(ctx, method, req)
-				s.auditToolCall(ctx, req, res, err, time.Since(start))
-				return res, err
+			if method != "tools/call" {
+				return next(ctx, method, req)
 			}
-			return next(ctx, method, req)
+			start := time.Now()
+			res, err := next(ctx, method, req)
+			s.auditToolCall(ctx, req, res, err, time.Since(start))
+			return res, err
 		}
 	}
 }
 
 // clientAttrs names the connected MCP client and a hash of its session.
 func clientAttrs(req mcp.Request) []slog.Attr {
+	ss, _ := req.GetSession().(*mcp.ServerSession)
+	return sessionAttrs(ss)
+}
+
+// sessionAttrs names the client of ss and a hash of its session ID. A nil ss
+// gives none.
+func sessionAttrs(ss *mcp.ServerSession) []slog.Attr {
 	var attrs []slog.Attr
-	ss, ok := req.GetSession().(*mcp.ServerSession)
-	if !ok || ss == nil {
+	if ss == nil {
 		return attrs
 	}
 	if ip := ss.InitializeParams(); ip != nil && ip.ClientInfo != nil {
@@ -269,14 +304,9 @@ func (s *Server) auditToolCall(ctx context.Context, req mcp.Request, res mcp.Res
 // pass the initialize request through middleware, so this is hooked in as the
 // server's InitializedHandler instead.
 func (s *Server) auditConnected(ctx context.Context, req *mcp.InitializedRequest) {
-	attrs := []slog.Attr{}
-	if req != nil && req.Session != nil {
-		if ip := req.Session.InitializeParams(); ip != nil && ip.ClientInfo != nil {
-			attrs = append(attrs, slog.String("client", truncate(ip.ClientInfo.Name+"/"+ip.ClientInfo.Version, maxAuditField)))
-		}
-		if id := shortHash(req.Session.ID()); id != "" {
-			attrs = append(attrs, slog.String("session", id))
-		}
+	var ss *mcp.ServerSession
+	if req != nil {
+		ss = req.Session
 	}
-	s.audit.LogAttrs(ctx, slog.LevelInfo, "client_connected", attrs...)
+	s.audit.LogAttrs(ctx, slog.LevelInfo, "client_connected", sessionAttrs(ss)...)
 }

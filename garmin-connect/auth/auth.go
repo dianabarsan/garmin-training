@@ -14,6 +14,7 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -22,8 +23,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dianabarsan/garmin-training/garmin-connect/internal/transport"
@@ -48,15 +51,35 @@ var (
 	// ErrMalformedToken is returned when the exchange response is not a JWT
 	// carrying an "exp" claim.
 	ErrMalformedToken = errors.New("auth: malformed access token")
+	// ErrInsecureBaseURL is returned (wrapped) when WithBaseURL names a
+	// plain-http host other than localhost: the key must not travel unencrypted.
+	ErrInsecureBaseURL = transport.ErrInsecureURL
+)
+
+const (
+	// attemptTimeout bounds each attempt of the exchange (see transport.Retry).
+	attemptTimeout = 30 * time.Second
+	// maxExp bounds the "exp" claim (the end of year 9999), so an absurd value
+	// cannot overflow when converted to a time.
+	maxExp = 253402300799
 )
 
 // Token is an access token and its expiry.
 type Token struct {
 	AccessToken string    `json:"access_token"`
 	ExpiresAt   time.Time `json:"expires_at"`
+	// IssuedAt is when the token was obtained. With ExpiresAt it gives the
+	// token's lifetime, which bounds how early it is renewed.
+	IssuedAt time.Time `json:"issued_at,omitzero"`
 	// KeyFingerprint ties a cached token to the key and host that produced
-	// it, so changing either invalidates the cache. It is a one-way hash.
+	// it, so changing either invalidates the cache. It is a salted SHA-256
+	// hash, so the key cannot be read back from it. The salt is stored beside
+	// it, so it only keeps fingerprints from being compared across files or
+	// against precomputed tables; what protects the key from guessing is its
+	// length.
 	KeyFingerprint string `json:"key_fingerprint"`
+	// KeySalt is the random salt of KeyFingerprint.
+	KeySalt string `json:"key_salt,omitempty"`
 }
 
 // TokenSource returns access tokens for one API key. It is safe for
@@ -64,24 +87,38 @@ type Token struct {
 type TokenSource struct {
 	apiKey        string
 	baseURL       string
+	urlErr        error // from checking baseURL; returned by AccessToken
 	httpClient    *http.Client
 	store         Store
 	now           func() time.Time
 	refreshBefore time.Duration
 
-	mu    sync.Mutex
-	token Token
+	// sem is held by the one caller performing an exchange. Others wait on it
+	// while honouring their own context.
+	sem chan struct{}
+	// waiting counts callers blocked on sem; tests read it.
+	waiting atomic.Int32
+
+	mu       sync.Mutex // guards the fields below
+	token    Token
+	revoked  string // an access token reported invalid through Invalidate
+	attempts uint64 // exchanges finished, successful or not
+	lastErr  error  // error of the last exchange, nil if it succeeded
 }
 
 // Option configures a TokenSource.
 type Option func(*TokenSource)
 
-// WithBaseURL overrides the host (for tests).
+// WithBaseURL overrides the host, for tests and sandboxes. It must use https,
+// except for a loopback host such as a local test server; otherwise
+// AccessToken returns ErrInsecureBaseURL.
 func WithBaseURL(u string) Option {
 	return func(s *TokenSource) { s.baseURL = strings.TrimRight(u, "/") }
 }
 
-// WithHTTPClient sets the HTTP client used for the exchange.
+// WithHTTPClient sets the HTTP client used for the exchange. It is used as
+// is: unlike the default client, it gets no retries and no per-attempt
+// timeout, so give it a Timeout or bound AccessToken with a context.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(s *TokenSource) {
 		if hc != nil {
@@ -90,18 +127,27 @@ func WithHTTPClient(hc *http.Client) Option {
 	}
 }
 
-// WithStore persists tokens across process restarts.
+// WithStore persists tokens across process restarts. A nil store, including
+// a nil pointer of any Store type, means no store.
 func WithStore(st Store) Option {
-	return func(s *TokenSource) { s.store = st }
+	return func(s *TokenSource) {
+		if v := reflect.ValueOf(st); v.Kind() == reflect.Pointer && v.IsNil() {
+			st = nil
+		}
+		s.store = st
+	}
 }
 
-// WithRefreshBefore sets how long before expiry a token is replaced.
+// WithRefreshBefore sets how long before expiry a token is replaced. For a
+// token whose whole lifetime is shorter than twice this, it is renewed halfway
+// through its life instead, so a short-lived token is not exchanged on every
+// call.
 func WithRefreshBefore(d time.Duration) Option {
 	return func(s *TokenSource) { s.refreshBefore = d }
 }
 
-// WithClock replaces time.Now (for tests).
-func WithClock(now func() time.Time) Option {
+// withClock replaces time.Now. Tests reach it through export_test.go.
+func withClock(now func() time.Time) Option {
 	return func(s *TokenSource) { s.now = now }
 }
 
@@ -112,53 +158,121 @@ func NewTokenSource(apiKey string, opts ...Option) *TokenSource {
 		baseURL:       DefaultBaseURL,
 		now:           time.Now,
 		refreshBefore: defaultRefreshBefore,
+		sem:           make(chan struct{}, 1),
 	}
 	for _, o := range opts {
-		o(s)
+		if o != nil {
+			o(s)
+		}
 	}
+	s.urlErr = transport.CheckBaseURL(s.baseURL)
 	if s.httpClient == nil {
+		// No overall timeout: each attempt is bounded instead, and the
+		// caller's context bounds the whole exchange.
 		s.httpClient = &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: &transport.Retry{MaxRetries: 2, MinBackoff: 200 * time.Millisecond, MaxBackoff: 5 * time.Second},
+			Transport: &transport.Retry{MaxRetries: 2, MinBackoff: 200 * time.Millisecond, MaxBackoff: 5 * time.Second, Timeout: attemptTimeout},
 		}
 	}
 	return s
 }
 
 // AccessToken returns a valid access token, exchanging the API key when the
-// cached one is missing or close to expiry.
+// cached one is missing, close to expiry, or was reported invalid.
+//
+// Only one exchange runs at a time. Callers that arrive meanwhile wait for it,
+// giving up when their own context ends, and then share its result: its token,
+// or its error, so a failing exchange is not repeated once per waiting caller.
 func (s *TokenSource) AccessToken(ctx context.Context) (string, error) {
 	if s.apiKey == "" {
 		return "", ErrNoAPIKey
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	fp := s.fingerprint()
-	if s.usable(s.token, fp) {
-		return s.token.AccessToken, nil
+	if s.urlErr != nil {
+		return "", fmt.Errorf("auth: %w", s.urlErr)
 	}
+	s.mu.Lock()
+	if s.usable(s.token) {
+		tok := s.token.AccessToken
+		s.mu.Unlock()
+		return tok, nil
+	}
+	seen := s.attempts
+	s.mu.Unlock()
+
+	s.waiting.Add(1)
+	select {
+	case s.sem <- struct{}{}:
+		s.waiting.Add(-1)
+	case <-ctx.Done():
+		s.waiting.Add(-1)
+		return "", ctx.Err()
+	}
+	defer func() { <-s.sem }()
+
+	s.mu.Lock()
+	if s.usable(s.token) { // another caller just obtained one
+		tok := s.token.AccessToken
+		s.mu.Unlock()
+		return tok, nil
+	}
+	if s.attempts > seen && s.lastErr != nil { // another caller just failed
+		err := s.lastErr
+		s.mu.Unlock()
+		return "", err
+	}
+	s.mu.Unlock()
+
 	if s.store != nil {
-		if t, ok, err := s.store.Load(ctx); err == nil && ok && s.usable(t, fp) {
-			s.token = t
-			return t.AccessToken, nil
+		// A broken cache must never block fetching a fresh token, so load
+		// errors are ignored.
+		if t, ok, err := s.store.Load(ctx); err == nil && ok && s.matches(t) {
+			s.mu.Lock()
+			if s.usable(t) {
+				s.token = t
+				s.mu.Unlock()
+				return t.AccessToken, nil
+			}
+			s.mu.Unlock()
 		}
-		// A broken cache must never block fetching a fresh token.
 	}
 
 	t, err := s.exchange(ctx)
+	s.mu.Lock()
+	s.attempts++
 	if err != nil {
+		// A failure caused by this caller's own context says nothing about
+		// the key or Garmin, so it is not handed to the callers waiting.
+		s.lastErr = nil
+		if ctx.Err() == nil {
+			s.lastErr = err
+		}
+		s.mu.Unlock()
 		return "", err
 	}
-	t.KeyFingerprint = fp
+	s.lastErr = nil
 	s.token = t
+	s.mu.Unlock()
 	if s.store != nil {
-		if err := s.store.Save(ctx, t); err != nil {
-			// The token is good; failing to cache it is not fatal.
-			return t.AccessToken, nil
-		}
+		// The token is good; failing to cache it is not fatal.
+		_ = s.store.Save(ctx, t)
 	}
 	return t.AccessToken, nil
+}
+
+// Invalidate reports that token was refused by the API although it had not
+// expired, for example because Garmin revoked it. The next AccessToken call
+// exchanges the key for a new one instead of returning it again, from memory
+// or from the store. It satisfies garminconnect.TokenInvalidator, which the
+// client uses to recover from such a refusal on its own.
+func (s *TokenSource) Invalidate(token string) {
+	if token == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revoked = token
+	if s.token.AccessToken == token {
+		s.token = Token{}
+	}
 }
 
 // ExpiresAt returns when the currently cached access token expires, or the zero
@@ -172,15 +286,39 @@ func (s *TokenSource) ExpiresAt() time.Time {
 	return s.token.ExpiresAt
 }
 
-func (s *TokenSource) usable(t Token, fp string) bool {
+// usable reports whether t can be handed out now. The caller holds s.mu.
+func (s *TokenSource) usable(t Token) bool {
 	return t.AccessToken != "" &&
-		t.KeyFingerprint == fp &&
-		s.now().Add(s.refreshBefore).Before(t.ExpiresAt)
+		t.AccessToken != s.revoked &&
+		s.now().Add(s.renewMargin(t)).Before(t.ExpiresAt)
 }
 
-func (s *TokenSource) fingerprint() string {
-	sum := sha256.Sum256([]byte(s.baseURL + "\x00" + s.apiKey))
+// renewMargin is how long before expiry t is replaced: refreshBefore, or half
+// the token's lifetime when that is shorter.
+func (s *TokenSource) renewMargin(t Token) time.Duration {
+	m := s.refreshBefore
+	if !t.IssuedAt.IsZero() {
+		if half := t.ExpiresAt.Sub(t.IssuedAt) / 2; half >= 0 && half < m {
+			m = half
+		}
+	}
+	return m
+}
+
+// matches reports whether a stored token was produced by this key and host.
+func (s *TokenSource) matches(t Token) bool {
+	return t.KeySalt != "" && t.KeyFingerprint == s.fingerprint(t.KeySalt)
+}
+
+func (s *TokenSource) fingerprint(salt string) string {
+	sum := sha256.Sum256([]byte(salt + "\x00" + s.baseURL + "\x00" + s.apiKey))
 	return hex.EncodeToString(sum[:])
+}
+
+func newSalt() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b) // crypto/rand.Read never fails on supported platforms
+	return hex.EncodeToString(b)
 }
 
 func (s *TokenSource) exchange(ctx context.Context) (Token, error) {
@@ -215,7 +353,8 @@ func (s *TokenSource) exchange(ctx context.Context) (Token, error) {
 	if err != nil {
 		return Token{}, err
 	}
-	return Token{AccessToken: raw, ExpiresAt: exp}, nil
+	salt := newSalt()
+	return Token{AccessToken: raw, ExpiresAt: exp, IssuedAt: s.now(), KeyFingerprint: s.fingerprint(salt), KeySalt: salt}, nil
 }
 
 // jwtExpiry reads the "exp" claim from a JWT without verifying its signature.
@@ -237,6 +376,9 @@ func jwtExpiry(token string) (time.Time, error) {
 	}
 	if claims.Exp == nil {
 		return time.Time{}, fmt.Errorf("%w: missing exp claim", ErrMalformedToken)
+	}
+	if e := *claims.Exp; !(e >= 0 && e <= maxExp) { // also rejects NaN
+		return time.Time{}, fmt.Errorf("%w: exp claim out of range", ErrMalformedToken)
 	}
 	return time.Unix(int64(*claims.Exp), 0), nil
 }

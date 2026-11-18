@@ -379,6 +379,37 @@ func TestDenyAuditor_TracksABoundedNumberOfSources(t *testing.T) {
 	}
 }
 
+// A full table of throttled addresses must not lock out new addresses
+// forever: once their window ends they are dropped, and what they had left
+// out is reported in one record.
+func TestDenyAuditor_FullTableOfThrottledSourcesIsEvicted(t *testing.T) {
+	t.Parallel()
+	var ac auditCapture
+	now := fixedNow
+	d := newDenyAuditor(ac.logger(), func() time.Time { return now })
+	addr := func(i int) string { return fmt.Sprintf("10.%d.%d.%d:1", i>>16&255, i>>8&255, i&255) }
+	for i := range deniedMaxSources {
+		for range deniedBurst + 2 { // two over budget each
+			d.record(deniedRequest(addr(i)), "invalid_token")
+		}
+	}
+	now = now.Add(deniedWindow)
+	d.record(deniedRequest("203.0.113.9:1"), "invalid_token")
+	if _, shared := d.sources["(other)"]; shared {
+		t.Error("a new address was put in the shared entry although every other entry had expired")
+	}
+	ev := ac.events(t, "access_denied_unrecorded")
+	if len(ev) != 1 {
+		t.Fatalf("unrecorded summaries = %+v", ev)
+	}
+	if n, _ := ev[0]["sources"].(float64); n != deniedMaxSources {
+		t.Errorf("sources = %v, want %d", ev[0]["sources"], deniedMaxSources)
+	}
+	if n, _ := ev[0]["previously_unrecorded"].(float64); n != 2*deniedMaxSources {
+		t.Errorf("previously_unrecorded = %v, want %d", ev[0]["previously_unrecorded"], 2*deniedMaxSources)
+	}
+}
+
 func TestAudit_RefusalFloodIsThrottledEndToEnd(t *testing.T) {
 	t.Parallel()
 	var ac auditCapture

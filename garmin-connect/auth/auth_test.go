@@ -168,6 +168,12 @@ func TestTokenSource_Errors(t *testing.T) {
 		{"missing exp", func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(makeJWT(`{"sub":"x"}`)))
 		}, "k", auth.ErrMalformedToken},
+		{"exp too large", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(makeJWT(`{"exp":1e300}`)))
+		}, "k", auth.ErrMalformedToken},
+		{"negative exp", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(makeJWT(`{"exp":-1}`)))
+		}, "k", auth.ErrMalformedToken},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -380,3 +386,194 @@ func TestTokenSource_ExpiresAt(t *testing.T) {
 		t.Errorf("ExpiresAt = %v, want %v", got, want)
 	}
 }
+
+func TestTokenSource_InvalidateForcesANewExchange(t *testing.T) {
+	t.Parallel()
+	clk := &clock{t: epoch}
+	f := newFake(t, "k", clk)
+	st := &auth.MemoryStore{}
+	ts := f.source("k", clk, auth.WithStore(st))
+	first, err := ts.AccessToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(time.Second) // so the new token differs
+	ts.Invalidate(first)
+	second, err := ts.AccessToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first || f.calls.Load() != 2 {
+		t.Errorf("after Invalidate: same token=%v, exchanges=%d; want a new token from a second exchange", second == first, f.calls.Load())
+	}
+	// A fresh source sharing the store must not be handed the revoked token
+	// by the same instance either: Invalidate on it also skips the store.
+	ts2 := f.source("k", clk, auth.WithStore(st))
+	ts2.Invalidate(second)
+	clk.Advance(time.Second) // so a fresh exchange yields a different token
+	if tok, _ := ts2.AccessToken(context.Background()); tok == second || f.calls.Load() != 3 {
+		t.Errorf("a revoked token was loaded back from the store (exchanges = %d)", f.calls.Load())
+	}
+}
+
+// A caller waiting for another caller's exchange gives up when its own
+// context ends, instead of waiting for the exchange to finish.
+func TestTokenSource_WaitingCallerHonoursItsContext(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		_, _ = w.Write([]byte(jwtExpiring(time.Now().Add(time.Hour))))
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	ts := auth.NewTokenSource("k", auth.WithBaseURL(srv.URL))
+
+	go func() { _, _ = ts.AccessToken(context.Background()) }()
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := ts.AccessToken(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("waited %v; should give up at its own deadline", took)
+	}
+}
+
+// Callers queued behind a failing exchange get its error instead of each
+// repeating the exchange against a server that is down.
+func TestTokenSource_QueuedCallersShareAFailure(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			<-release
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	ts := auth.NewTokenSource("k", auth.WithBaseURL(srv.URL), auth.WithHTTPClient(&http.Client{}))
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := ts.AccessToken(context.Background())
+			errs <- err
+		}()
+	}
+	// One caller is in the exchange; wait until the other nine are queued.
+	for calls.Load() == 0 || ts.Waiting() < 9 {
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err == nil {
+			t.Error("a caller got a token from a failing server")
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("exchanges = %d, want 1 shared by every queued caller", got)
+	}
+}
+
+// A token that lives less than twice the refresh margin is renewed halfway
+// through its life, not on every call.
+func TestTokenSource_ShortLivedTokenIsNotExchangedOnEveryCall(t *testing.T) {
+	t.Parallel()
+	clk := &clock{t: epoch}
+	f := newFake(t, "k", clk)
+	f.expiresIn = 5 * time.Minute // shorter than the default 10-minute margin
+	ts := f.source("k", clk)
+	for range 3 {
+		if _, err := ts.AccessToken(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.calls.Load() != 1 {
+		t.Fatalf("exchanges = %d, want 1", f.calls.Load())
+	}
+	clk.Advance(3 * time.Minute) // past half its life
+	if _, err := ts.AccessToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.calls.Load() != 2 {
+		t.Errorf("exchanges = %d, want 2 after half the lifetime", f.calls.Load())
+	}
+}
+
+func TestTokenSource_RefusesPlainHTTPToARemoteHost(t *testing.T) {
+	t.Parallel()
+	for _, u := range []string{"http://example.com", "http://192.0.2.1:8080"} {
+		_, err := auth.NewTokenSource("k", auth.WithBaseURL(u)).AccessToken(context.Background())
+		if !errors.Is(err, auth.ErrInsecureBaseURL) {
+			t.Errorf("%s: err = %v, want ErrInsecureBaseURL", u, err)
+		}
+	}
+}
+
+func TestTokenSource_StoredTokenIsSalted(t *testing.T) {
+	t.Parallel()
+	clk := &clock{t: epoch}
+	f := newFake(t, "k", clk)
+	st := &auth.MemoryStore{}
+	if _, err := f.source("k", clk, auth.WithStore(st)).AccessToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	a, _, _ := st.Load(context.Background())
+	if a.KeySalt == "" || a.KeyFingerprint == "" || a.IssuedAt.IsZero() {
+		t.Fatalf("stored token = %+v", a)
+	}
+	// The same key gets a different fingerprint each time, so the file cannot
+	// be matched against a precomputed hash of a guessed key.
+	st2 := &auth.MemoryStore{}
+	clk.Advance(time.Second)
+	if _, err := f.source("k", clk, auth.WithStore(st2)).AccessToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, _, _ := st2.Load(context.Background())
+	if a.KeyFingerprint == b.KeyFingerprint || a.KeySalt == b.KeySalt {
+		t.Error("two tokens for the same key share a fingerprint")
+	}
+}
+
+func TestFileStore_LoadMakesALooseFilePrivate(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "token.json")
+	if err := os.WriteFile(path, []byte(`{"access_token":"a.b.c"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(path, 0o644)
+	if _, ok, err := auth.NewFileStore(path).Load(context.Background()); !ok || err != nil {
+		t.Fatalf("Load: ok=%v err=%v", ok, err)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestWithStore_NilPointerMeansNoStore(t *testing.T) {
+	t.Parallel()
+	clk := &clock{t: epoch}
+	f := newFake(t, "k", clk)
+	for _, st := range []auth.Store{(*auth.FileStore)(nil), (*auth.MemoryStore)(nil), (*customStore)(nil), nil} {
+		if _, err := f.source("k", clk, auth.WithStore(st)).AccessToken(context.Background()); err != nil {
+			t.Errorf("%T: %v", st, err)
+		}
+	}
+}
+
+// customStore is a Store type the auth package does not know about.
+type customStore struct{ auth.MemoryStore }

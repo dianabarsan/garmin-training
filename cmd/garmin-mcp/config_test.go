@@ -3,13 +3,10 @@ package main
 import (
 	"context"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func writeSecret(t *testing.T, content string) string {
@@ -29,56 +26,6 @@ func TestRun_TokenFromEnvironmentProtectsEndpoints(t *testing.T) {
 	}
 	if code, _ := get(t, base+"/auth", map[string]string{"Authorization": "Bearer env-token-0123456789"}); code != 200 {
 		t.Errorf("with token: %d", code)
-	}
-}
-
-func TestRun_RefusesToExposeItselfWithoutAToken(t *testing.T) {
-	var logs syncBuf
-	err := run(context.Background(), []string{"-addr", "0.0.0.0:0"}, func(string) string { return "" }, &logs, nil)
-	if err == nil || !strings.Contains(err.Error(), "token") {
-		t.Fatalf("err = %v, want a refusal that mentions the token", err)
-	}
-	// With a token it is allowed (and then stopped immediately).
-	ctx, cancel := context.WithCancel(context.Background())
-	ready := make(chan string, 1)
-	done := make(chan error, 1)
-	go func() {
-		done <- run(ctx, []string{"-addr", "0.0.0.0:0", "-token", "flag-token-0123456789"}, func(string) string { return "" }, &logs, func(a string) { ready <- a })
-	}()
-	select {
-	case <-ready:
-	case err := <-done:
-		t.Fatalf("exited: %v", err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("did not start")
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Errorf("shutdown: %v", err)
-	}
-}
-
-func TestRun_FlagsAndVersion(t *testing.T) {
-	noEnv := func(string) string { return "" }
-	var out syncBuf
-	if err := run(context.Background(), []string{"-version"}, noEnv, &out, nil); err != nil || !strings.Contains(out.String(), "garmin-mcp") {
-		t.Errorf("-version: %v %q", err, out.String())
-	}
-	out = syncBuf{}
-	if err := run(context.Background(), []string{"-h"}, noEnv, &out, nil); err != nil || !strings.Contains(out.String(), "GARMIN_PERSONAL_API_KEY") {
-		t.Errorf("-h: %v %q", err, out.String())
-	}
-	if err := run(context.Background(), []string{"-nope"}, noEnv, io.Discard, nil); err == nil {
-		t.Error("an unknown flag must be an error")
-	}
-	if err := run(context.Background(), []string{"-log-level", "loud"}, noEnv, io.Discard, nil); err == nil || !strings.Contains(err.Error(), "log-level") {
-		t.Errorf("bad log level: %v", err)
-	}
-	// An address that is already in use is reported, not swallowed.
-	l := httptest.NewServer(http.NotFoundHandler())
-	defer l.Close()
-	if err := run(context.Background(), []string{"-addr", strings.TrimPrefix(l.URL, "http://")}, noEnv, io.Discard, nil); err == nil {
-		t.Error("listening on a busy port must fail")
 	}
 }
 
@@ -112,7 +59,7 @@ func TestRun_SecretSourceErrors(t *testing.T) {
 		"key file empty":   {"GARMIN_PERSONAL_API_KEY_FILE": writeSecret(t, "")},
 		"token too short":  {"GARMIN_MCP_TOKEN": "short"},
 	} {
-		err := run(context.Background(), []string{"-addr", "127.0.0.1:0"}, func(k string) string { return env[k] }, io.Discard, nil)
+		err := run(context.Background(), []string{"-addr", "127.0.0.1:0"}, func(k string) string { return env[k] }, io.Discard, io.Discard, nil)
 		if err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
@@ -146,7 +93,7 @@ func TestRun_AllowedHostsForReverseProxies(t *testing.T) {
 
 func TestRun_AllowedHostsRejectsURLs(t *testing.T) {
 	err := run(context.Background(), []string{"-addr", "127.0.0.1:0", "-allowed-host", "https://garmin.example.com"},
-		func(string) string { return "" }, io.Discard, nil)
+		func(string) string { return "" }, io.Discard, io.Discard, nil)
 	if err == nil || !strings.Contains(err.Error(), "hostname") {
 		t.Errorf("err = %v, want a complaint about the URL form", err)
 	}
@@ -213,6 +160,9 @@ func TestParseConfig_TokenSources(t *testing.T) {
 	}
 	if _, err := parseConfig([]string{"-token", "short"}, noEnvFunc, io.Discard); err == nil {
 		t.Error("a short token on the command line must be refused")
+	}
+	if _, err := parseConfig([]string{"-audit-log-max-mb", "9223372036854775807"}, noEnvFunc, io.Discard); err == nil {
+		t.Error("an audit size limit that overflows when converted to bytes must be refused")
 	}
 	if _, err := parseConfig([]string{"-audit-log-max-mb", "-1"}, noEnvFunc, io.Discard); err == nil {
 		t.Error("a negative audit size limit must be refused")

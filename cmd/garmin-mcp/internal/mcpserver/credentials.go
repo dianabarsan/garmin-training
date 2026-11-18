@@ -19,7 +19,9 @@ import (
 var ErrNotAuthenticated = errors.New("not authenticated: no Garmin Personal API key has been provided")
 
 // ErrKeyNotSaved is returned (wrapped) by Set when Garmin accepted the key but
-// the key store could not save it. The key is not activated in that case.
+// the key store could not save it. Set does not activate the key in that case;
+// a caller that wants to run with it anyway, as the server does at startup for
+// the key in its own configuration, can activate it with UseUnverified.
 var ErrKeyNotSaved = errors.New("the key could not be saved")
 
 // KeyStore persists the API key across restarts. It is optional.
@@ -208,6 +210,18 @@ func (c *Credentials) loadPersisted() bool {
 		c.persisted, c.persistedKnown = err == nil && ok, err == nil
 	}
 	return c.persisted
+}
+
+// Invalidate implements garminconnect.TokenInvalidator: the client calls it
+// when Garmin refuses a token that has not expired, and then retries with a
+// fresh one.
+func (c *Credentials) Invalidate(token string) {
+	c.mu.RLock()
+	ts := c.ts
+	c.mu.RUnlock()
+	if ts != nil {
+		ts.Invalidate(token)
+	}
 }
 
 // AccessToken implements garminconnect.TokenSource.

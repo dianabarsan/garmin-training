@@ -124,8 +124,8 @@ func TestSleep_FullDocumentedSchema(t *testing.T) {
 		n.RecommendedBedtimeStartMins != 1360 || n.RecommendedBedtimeEndMins != 0 {
 		t.Errorf("sleepNeed = %+v", n)
 	}
-	if want := time.Date(2026, 11, 15, 18, 40, 12, 0, time.UTC); !n.Timestamp.Equal(want) {
-		t.Errorf("need timestamp = %v", n.Timestamp.Time)
+	if want := time.Date(2026, 11, 15, 18, 40, 12, 0, time.UTC); !n.Time.Equal(want) {
+		t.Errorf("need timestamp = %v", n.Time.Time)
 	}
 	if s.NextSleepNeed == nil || s.NextSleepNeed.ActualMins != 450 {
 		t.Errorf("nextSleepNeed = %+v", s.NextSleepNeed)

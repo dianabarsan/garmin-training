@@ -35,7 +35,7 @@ var version = "dev"
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, os.Args[1:], os.Getenv, os.Stderr, nil); err != nil {
+	if err := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr, nil); err != nil {
 		fmt.Fprintln(os.Stderr, "garmin-mcp:", err)
 		os.Exit(1)
 	}
@@ -43,7 +43,7 @@ func main() {
 
 // run starts the server and blocks until ctx is cancelled or serving fails.
 // ready, when non-nil, is called with the bound address once it is listening.
-func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer, ready func(addr string)) error {
+func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer, ready func(addr string)) error {
 	cfg, err := parseConfig(args, getenv, stderr)
 	switch {
 	case errors.Is(err, flag.ErrHelp):
@@ -51,7 +51,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	case err != nil:
 		return err
 	case cfg.showVersion:
-		fmt.Fprintln(stderr, "garmin-mcp", version)
+		fmt.Fprintln(stdout, "garmin-mcp", version)
 		return nil
 	case cfg.healthcheck:
 		return probeHealth(ctx, cfg.addr)

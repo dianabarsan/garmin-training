@@ -1,0 +1,16 @@
+// The server (the repository root) and the library (garmin-connect/) are
+// separate modules. This workspace builds the server against the library in
+// this repository rather than the version its go.mod requires, so changes to
+// both can be made and tested together. `go install …@version` and anyone
+// importing the modules ignore it.
+go 1.27.0
+
+use (
+	.
+	./garmin-connect
+)
+
+// The go command still reads the go.mod of the library version the server
+// requires. This points that version at the library here, so the workspace
+// also builds before it is tagged. Keep the version in step with go.mod.
+replace github.com/dianabarsan/garmin-training/garmin-connect v0.1.0 => ./garmin-connect

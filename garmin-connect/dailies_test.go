@@ -209,3 +209,19 @@ func TestStressValues_MarshalIncludesOtherOnlyWhenPresent(t *testing.T) {
 }
 
 // --- Heart rate: abnormal-HR fields from Garmin's schema -----------------------
+
+func TestStressValues_OtherSurvivesEncodingAndDecoding(t *testing.T) {
+	t.Parallel()
+	in := garminconnect.StressValues{OverallLevel: 30, RestSeconds: 100, Other: map[string]float64{"newMetric": 7}}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out garminconnect.StressValues
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Other["newMetric"] != 7 || out.RestSeconds != 100 || out.OverallLevel != 30 {
+		t.Errorf("round trip: %+v from %s", out, b)
+	}
+}

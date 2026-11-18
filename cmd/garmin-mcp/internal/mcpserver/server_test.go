@@ -119,3 +119,30 @@ func TestAuthEndpointEnabled_GuidanceStillMentionsIt(t *testing.T) {
 		t.Errorf("rejected-key error = %q", resultText(res))
 	}
 }
+
+func TestNew_RefusesExposedServerWithoutToken(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	base := Config{API: h.srv.api, Credentials: h.creds}
+	for _, addr := range []string{"0.0.0.0:8808", ":8808", "192.168.1.5:8808", "example.com:80", "[::]:8808"} {
+		cfg := base
+		cfg.Addr = addr
+		if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "token") {
+			t.Errorf("Addr %q without token: err = %v, want a refusal", addr, err)
+		}
+		cfg.Token = "tok"
+		if _, err := New(cfg); err != nil {
+			t.Errorf("Addr %q with token: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"", "127.0.0.1:8808", "localhost:8808", "[::1]:8808"} {
+		cfg := base
+		cfg.Addr = addr
+		if _, err := New(cfg); err != nil {
+			t.Errorf("loopback %q should be allowed without a token: %v", addr, err)
+		}
+	}
+	if _, err := New(Config{}); err == nil {
+		t.Error("missing API and Credentials must be an error")
+	}
+}

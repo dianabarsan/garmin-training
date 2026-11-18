@@ -4,19 +4,51 @@ on:
     branches: [main]
   pull_request:
 
+# Two modules: the library (garmin-connect/, its own go.mod) and the server
+# (the repository root). The committed go.work builds the server against the
+# library in this repository.
+#
+# The test job lints and tests both modules on the server's Go version (the
+# root go.mod), which the pinned staticcheck supports. The library's own,
+# older minimum version is tested separately in library-minimum-go.
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [".", "garmin-connect"]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: go.mod # the root module's, for both modules (see above)
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - name: vet
         run: go vet ./...
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       - name: test
         run: go test -race -cover ./...
+
+  # The library promises to work with the Go version in its go.mod. The
+  # workspace is turned off: its go line would make the go command fetch a
+  # newer toolchain.
+  library-minimum-go:
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+      GOTOOLCHAIN: local
+    defaults:
+      run:
+        working-directory: garmin-connect
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: garmin-connect/go.mod
+      - name: test
+        run: go test ./...

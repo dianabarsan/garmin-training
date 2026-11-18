@@ -137,11 +137,12 @@ func TestHeartRateZonesFor(t *testing.T) {
 	}
 
 	noDefault, _ := serve(t, `[{"sport":"RUNNING","zone1Floor":100}]`)
-	if _, err := noDefault.HeartRateZonesFor(ctx, "cycling"); !errors.Is(err, garminconnect.ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
+	// No configuration is not the same as an HTTP 404.
+	if _, err := noDefault.HeartRateZonesFor(ctx, "cycling"); !errors.Is(err, garminconnect.ErrNoZones) || errors.Is(err, garminconnect.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNoZones and not ErrNotFound", err)
 	}
-	if _, err := noContentClient(t).HeartRateZonesFor(ctx, "running"); !errors.Is(err, garminconnect.ErrNotFound) {
-		t.Errorf("no data err = %v, want ErrNotFound", err)
+	if _, err := noContentClient(t).HeartRateZonesFor(ctx, "running"); !errors.Is(err, garminconnect.ErrNoZones) {
+		t.Errorf("no data err = %v, want ErrNoZones", err)
 	}
 }
 

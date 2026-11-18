@@ -182,7 +182,7 @@ discarded.
 | `-allowed-host` / `GARMIN_MCP_ALLOWED_HOSTS` | Public hostname(s), comma separated, that the server may be reached as. Set it behind a reverse proxy; other `Host` values are refused. On Fly.io, `<FLY_APP_NAME>.fly.dev` is added automatically. |
 | `-disable-auth-endpoint` / `GARMIN_MCP_DISABLE_AUTH_ENDPOINT` | Serve no `/auth` or key page (both answer 404), so a leaked token can never replace the key. The key must then come from `GARMIN_PERSONAL_API_KEY[_FILE]` or an existing `-key-store`; the server refuses to start without one. Use it whenever the server is reachable from outside. |
 | `-audit-log` / `GARMIN_MCP_AUDIT_LOG` | Append the audit trail (see below) to this file as JSON lines, mode `0600`. Without it the records appear in the normal log, tagged `audit=true`. |
-| `-audit-log-max-mb` (default `10`) | When the audit file would grow past this size it is renamed to `<file>.1`, replacing an older one, and a new file is started. `0` disables the limit. |
+| `-audit-log-max-mb` (default `10`) | When the audit file would grow past this size it is renamed to `<file>.1`, replacing an older one, and a new file is started. `0` disables the limit; the most allowed is `1048576` (1 TiB). |
 | `-key-store` / `GARMIN_MCP_KEY_STORE` | Persist the key in this file. |
 | `GARMIN_PERSONAL_API_KEY` | Key to use at startup (wins over the key store). |
 | `GARMIN_MCP_TOKEN_FILE`, `GARMIN_PERSONAL_API_KEY_FILE` | Read the token / key from a file instead (Docker secrets). Setting both forms of one is an error, and so is an empty file, so a failed secret mount never starts the server without a token. |
@@ -223,6 +223,7 @@ read if a token ever leaks.
 | `client_connected` | A client finished the MCP handshake over HTTP | `client`, `session` |
 | `access_denied` | A request was refused | `reason` (`missing_token`, `invalid_token`, `forbidden_host`, `cross_origin`), `method`, `path`, `remote`, `forwarded_for`, `user_agent`, plus the `host` or `origin` that was rejected, and `previously_unrecorded` after throttling (below) |
 | `access_denied_throttled` | One address was refused more than 20 times in a minute; its further refusals in that minute are counted, not recorded | `remote`, `forwarded_for`, `recorded`, `resumes_at` |
+| `access_denied_unrecorded` | Throttled addresses were dropped from the throttle's table (it tracks 1,024 at a time) before they could report their counts | `sources`, `previously_unrecorded` |
 | `key_set`, `key_rejected`, `key_set_failed`, `key_cleared` | The Garmin key was provided, refused, failed to validate, or removed at `/auth` | `remote`, `forwarded_for` |
 
 Records go into the normal log tagged `audit=true`, or, with `-audit-log path`, into a
@@ -273,14 +274,20 @@ calls without exposing an identifier that could be replayed.
 
 ## For developers
 
-The repository has two parts:
+The repository holds two Go modules:
 
-- `garmin-connect/` is an importable Go library for the Personal API,
-  `github.com/dianabarsan/garmin-training/garmin-connect` (package `garminconnect`), with its
-  token handling in `garmin-connect/auth`. It depends on the standard library only.
-- `cmd/garmin-mcp/` is the MCP server: the `main` package handles configuration, logging,
-  listening and shutdown, and `internal/mcpserver` holds the tools and HTTP routes. It is
-  the only place that uses a third-party module (the official MCP Go SDK).
+- `garmin-connect/` is an importable library for the Personal API, its own module
+  `github.com/dianabarsan/garmin-training/garmin-connect` (package `garminconnect`), with
+  token handling in `garmin-connect/auth`. It depends on the standard library only, so
+  importing it adds nothing else to your module graph, and it needs Go 1.24 or later.
+- The repository root is the MCP server's module. `cmd/garmin-mcp/` holds the `main`
+  package (configuration, logging, listening and shutdown) and `internal/mcpserver` (the
+  tools and HTTP routes). It requires a tagged version of the library and is the only place
+  that uses a third-party module (the official MCP Go SDK).
+
+The committed `go.work` makes the go command build the server against the library in this
+repository, so a change to both can be made and tested together. `go install` and anyone
+importing the modules ignore it.
 
 ### Using the library
 
@@ -294,30 +301,86 @@ ts := auth.NewTokenSource(os.Getenv("GARMIN_PERSONAL_API_KEY"))
 c := garminconnect.New(garminconnect.WithTokenSource(ts))
 
 acts, err := c.Activities(ctx, garminconnect.ActivitiesOptions{SubTypeKey: "strength_training", Limit: 5})
+if err != nil {
+	return err
+}
+if len(acts) == 0 {
+	return nil // no strength workouts yet
+}
 series, err := c.ActivitySeries(ctx, acts[0].ID)
+if err != nil {
+	return err
+}
 splits, err := series.Splits(1000)
 ```
 
 It covers activities (list, paging, filters, detail, FIT download, per-second series,
 splits, strength breakdown), daily summaries, steps, stress, sleep, heart rate, HRV,
-Body Battery, VO2 max and heart-rate zones. Long date ranges are split automatically to
-fit Garmin's per-endpoint caps, and HTTP 204 ("no data") is an empty result, not an
-error.
+Body Battery, VO2 max and heart-rate zones.
+
+Behaviour worth knowing:
+
+- **Dates** are formatted in the `time.Time`'s own location, so pass dates in the user's
+  time zone (`time.Now()` in UTC can be a different calendar day).
+- **Long date ranges** are split automatically to fit Garmin's per-endpoint caps, up to
+  `MaxRangeDays` (about ten years). If a later request fails, the results fetched so far
+  are returned along with the error.
+- **No data** (HTTP 204, or a JSON `null`) is an empty result, not an error.
+- **Errors** match sentinels with `errors.Is`: `ErrUnauthorized`, `ErrForbidden`,
+  `ErrNotFound`, `ErrBadRequest`, `ErrRateLimited`, `ErrServer`, and others listed in the
+  package documentation. `*APIError` carries the status code.
+- **Timeouts and retries:** requests have no overall timeout, so bound them with your
+  context. Each attempt is limited instead (`WithAttemptTimeout`, default 30 s for the
+  headers and for any gap in the body), and timeouts, dropped connections, 429 and most 5xx
+  responses are retried with backoff (`WithRetry`). A download (`DownloadActivity`) that
+  stalls part way is not retried, since part of it is already written; it fails with
+  `ErrAttemptTimeout`.
+- **Revoked tokens:** a 401 is retried once with a fresh token when the token source
+  implements `TokenInvalidator`, as `auth.TokenSource` does. This happens at most once a
+  minute, so an endpoint that keeps refusing does not cost a key exchange per request.
+- **Limits:** JSON responses are capped at 64 MB (`WithMaxResponseBytes`).
+  `DownloadActivity` streams to your writer and is not capped. Base URLs must use https,
+  except for a local test server.
+- **Models are for decoding.** Encoding one to JSON does not reproduce Garmin's format;
+  keep `Raw()` to store or forward a response.
 
 ### Development
 
+Run the checks in both modules:
+
 ```sh
-go vet ./... && go test -race -cover ./...
+go vet ./... && go test -race -cover ./...                                    # the server
+(cd garmin-connect && go vet ./... && go test -race -cover ./...)             # the library
 ```
 
 Live checks against your own account are behind the `live` build tag and read the key
 from a file named `key` in the repository root (git-ignored):
 
 ```sh
-go test -tags live -run TestLive -v ./cmd/garmin-mcp        # the server, every tool
-go test -tags live -run TestLiveTyped -v ./garmin-connect   # the library
+go test -tags live -run TestLive -v ./cmd/garmin-mcp                     # the server, every tool
+(cd garmin-connect && go test -tags live -run TestLiveTyped -v .)        # the library
 ```
 
 `garmin-connect/testdata/shapes/` holds the structure of real responses with every value blanked.
 `garmin-connect/testdata/live/` (git-ignored) is where raw captures go; it can contain GPS and health
 data and must not be committed.
+
+### Releasing
+
+The library is tagged `garmin-connect/vX.Y.Z` and the server `vX.Y.Z`. The server's
+`go.mod` must require a library version that has been tagged, so a release that changes
+the library takes two steps:
+
+1. Tag and push the library: `git tag garmin-connect/vX.Y.Z && git push origin garmin-connect/vX.Y.Z`.
+2. Require it in the root `go.mod`, record its checksums without the workspace, then
+   commit, tag and push the server:
+
+   ```sh
+   go mod edit -require=github.com/dianabarsan/garmin-training/garmin-connect@vX.Y.Z
+   GOWORK=off go mod tidy && GOWORK=off go build ./...
+   ```
+
+   Then change the version in the `replace` line of `go.work` to match.
+
+Until the first library tag (`garmin-connect/v0.1.0`) exists, the server builds only
+inside the workspace.

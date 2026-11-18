@@ -197,6 +197,10 @@ func (s *Server) userError(err error) error {
 		return errors.New("the Garmin API is rate limiting requests; wait a little and retry")
 	case errors.Is(err, garminconnect.ErrNotFound):
 		return errors.New("not found: Garmin has nothing for that request; check the id or date")
+	case errors.Is(err, garminconnect.ErrNoZones):
+		return errors.New("no heart rate zones are configured for that sport, and there are no default zones; the user can set them up in Garmin Connect")
+	case errors.Is(err, garminconnect.ErrServer):
+		return errors.New("the Garmin API returned a server error; wait a little and retry")
 	case errors.Is(err, garminconnect.ErrNoDistance):
 		return errors.New("this activity has no distance data (for example strength training or an indoor workout), so it cannot be split by distance")
 	}

@@ -203,16 +203,14 @@ func (d *BodyBatteryDay) UnmarshalJSON(b []byte) error {
 }
 
 // BodyBattery returns Body Battery data for each day in [start, end].
-// Ranges longer than 31 days are fetched in several requests and joined.
+// Ranges longer than 31 days are fetched in several requests and joined;
+// if one fails, the days fetched before it are returned with the error.
 func (c *Client) BodyBattery(ctx context.Context, start, end time.Time) ([]BodyBatteryDay, error) {
 	return fetchRange(ctx, start, end, maxBodyBatteryDays, c.bodyBattery)
 }
 
 // bodyBattery fetches a single window that fits within Garmin's range cap.
 func (c *Client) bodyBattery(ctx context.Context, start, end time.Time) ([]BodyBatteryDay, error) {
-	if err := checkRange(start, end); err != nil {
-		return nil, err
-	}
 	var raw json.RawMessage
 	q := url.Values{"startDate": {dateParam(start)}, "endDate": {dateParam(end)}}
 	if err := c.get(ctx, "/wellness-service/wellness/bodyBattery/reports/daily", q, &raw); err != nil {
@@ -258,11 +256,15 @@ func numberAt(row []json.RawMessage, i int) (float64, bool) {
 // HRVRange returns the nightly HRV summary for each day in [start, end], oldest
 // first. Days Garmin has no HRV for are absent, and a range with no data at all
 // (HTTP 204) returns an empty slice. It carries the summaries only; use HRV for
-// a night's individual readings.
+// a night's individual readings. Ranges longer than 366 days are fetched in
+// several requests and joined; if one fails, the days fetched before it are
+// returned with the error.
 func (c *Client) HRVRange(ctx context.Context, start, end time.Time) ([]HRVSummary, error) {
-	if err := checkRange(start, end); err != nil {
-		return nil, err
-	}
+	return fetchRange(ctx, start, end, maxHRVDays, c.hrvRange)
+}
+
+// hrvRange fetches one window of at most maxHRVDays.
+func (c *Client) hrvRange(ctx context.Context, start, end time.Time) ([]HRVSummary, error) {
 	var env struct {
 		Summaries json.RawMessage `json:"hrvSummaries"`
 	}

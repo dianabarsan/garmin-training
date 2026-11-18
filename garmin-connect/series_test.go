@@ -499,3 +499,47 @@ func TestSplits_ElevationTracksRealClimbThroughJitter(t *testing.T) {
 		t.Errorf("loss = %v, want about 0", got[0].ElevationLoss)
 	}
 }
+
+func TestSplits_RejectsASplitSizeThatWouldMakeTooManySplits(t *testing.T) {
+	t.Parallel()
+	s := runner(4, 10000, 1)
+	if _, err := s.Splits(1e-6); !errors.Is(err, garminconnect.ErrInvalidSplitSize) {
+		t.Errorf("err = %v, want ErrInvalidSplitSize", err)
+	}
+	if got, err := s.Splits(1); err != nil || len(got) != 10000 {
+		t.Errorf("1 m splits: %d, err %v", len(got), err)
+	}
+}
+
+// One reading that jumps ahead must not swallow the rest of the activity.
+func TestSplits_IgnoresAForwardDistanceSpike(t *testing.T) {
+	t.Parallel()
+	s := runner(4, 2000, 1)
+	s.Points[100].Distance = 1900 // spike: far ahead of the true 400 m
+	got, err := s.Splits(1000)
+	if err != nil || len(got) != 2 || got[1].Partial || !near(got[0].Duration, 250, 1e-9) || !near(got[1].Duration, 250, 1e-9) {
+		t.Errorf("got %+v err %v", got, err)
+	}
+}
+
+// A long activity is re-requested at most at the sample cap, whatever total
+// the server claims.
+func TestActivitySeries_SecondRequestIsCapped(t *testing.T) {
+	t.Parallel()
+	var sizes []string
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sizes = append(sizes, r.URL.Query().Get("maxChartSize"))
+		rows := [][]any{{1, 0.0, 100, 0.0, 0.0, 1.0, 1, 1, 0.0, 0.0}, {1, 1.0, 100, 1.0, 0.0, 1.0, 1, 1, 0.0, 0.0}}
+		_, _ = w.Write([]byte(seriesBody(rows, 2, 1_000_000_000)))
+	}))
+	s, err := c.ActivitySeries(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(sizes, ",") != "20000,200000" {
+		t.Errorf("requested sizes = %v, want 20000 then the cap 200000", sizes)
+	}
+	if !s.Downsampled {
+		t.Error("a series cut at the cap is downsampled")
+	}
+}

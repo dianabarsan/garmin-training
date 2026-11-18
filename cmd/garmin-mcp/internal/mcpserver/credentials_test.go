@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	garminconnect "github.com/dianabarsan/garmin-training/garmin-connect"
 	"github.com/dianabarsan/garmin-training/garmin-connect/auth"
 )
 
@@ -299,5 +300,30 @@ func TestCredentials_ConcurrentSetAndClearStayConsistent(t *testing.T) {
 		if active != stored {
 			t.Fatalf("round %d: active key = %v but stored key = %v", round, active, stored)
 		}
+	}
+}
+
+// Credentials passes Invalidate on, so the client recovers when Garmin
+// revokes a token before it expires.
+func TestCredentials_ImplementsTokenInvalidator(t *testing.T) {
+	t.Parallel()
+	fg := newFakeGarmin(t)
+	c := NewCredentials(WithAuthBaseURL(fg.srv.URL))
+	var _ garminconnect.TokenInvalidator = c
+	c.Invalidate("anything") // no key yet: a no-op
+	if err := c.Set(context.Background(), validKey); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := c.AccessToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := fg.exchangeCount()
+	c.Invalidate(tok)
+	if _, err := c.AccessToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fg.exchangeCount() != before+1 {
+		t.Errorf("exchanges %d -> %d, want one new exchange after Invalidate", before, fg.exchangeCount())
 	}
 }

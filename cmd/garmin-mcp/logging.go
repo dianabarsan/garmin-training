@@ -44,24 +44,24 @@ func newAuditLogger(path string, maxBytes int64, ops *slog.Logger) (*slog.Logger
 	return logger, func() { _ = w.Close() }, nil
 }
 
-// rotatingFile appends to a file and, when a write would take it past max
+// rotatingFile appends to a file and, when a write would take it past maxBytes
 // bytes, moves it to path.1 and starts a new one. slog handlers write each
 // record in one call, so records are never split across the two files.
 type rotatingFile struct {
-	path string
-	max  int64
+	path     string
+	maxBytes int64
 
 	mu   sync.Mutex
 	f    *os.File
 	size int64
 }
 
-func openRotating(path string, max int64) (*rotatingFile, error) {
+func openRotating(path string, maxBytes int64) (*rotatingFile, error) {
 	f, size, err := openAppend(path)
 	if err != nil {
 		return nil, err
 	}
-	return &rotatingFile{path: path, max: max, f: f, size: size}, nil
+	return &rotatingFile{path: path, maxBytes: maxBytes, f: f, size: size}, nil
 }
 
 func openAppend(path string) (*os.File, int64, error) {
@@ -80,7 +80,7 @@ func openAppend(path string) (*os.File, int64, error) {
 func (r *rotatingFile) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.max > 0 && r.size > 0 && r.size+int64(len(p)) > r.max {
+	if r.maxBytes > 0 && r.size > 0 && r.size+int64(len(p)) > r.maxBytes {
 		// If rotating fails, keep appending to the current file: losing
 		// audit records would be worse than exceeding the limit.
 		_ = r.rotate()
@@ -91,13 +91,16 @@ func (r *rotatingFile) Write(p []byte) (int, error) {
 }
 
 // rotate renames the current file to path.1 and opens a fresh one. The old
-// descriptor stays in use until the new file is open.
+// descriptor stays in use until the new file is open. If the new file cannot
+// be opened, the current one is renamed back, so records keep going to path
+// rather than to path.1.
 func (r *rotatingFile) rotate() error {
 	if err := os.Rename(r.path, r.path+".1"); err != nil {
 		return err
 	}
 	f, size, err := openAppend(r.path)
 	if err != nil {
+		_ = os.Rename(r.path+".1", r.path)
 		return err
 	}
 	_ = r.f.Close()

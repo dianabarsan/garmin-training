@@ -8,7 +8,6 @@ import (
 	"math"
 	"net/url"
 	"strconv"
-	"time"
 )
 
 // Errors returned by Splits.
@@ -29,8 +28,17 @@ const elevationDeadband = 1.0
 
 // seriesChartSize is the first-try resolution requested from Garmin. It covers
 // activities up to about 5.5 hours at one sample per second; longer ones are
-// re-requested using the total Garmin reports.
+// re-requested using the total Garmin reports, up to maxSeriesSamples.
 const seriesChartSize = 20000
+
+// maxSeriesSamples bounds the second request: about 55 hours at one sample per
+// second. Total comes from the server, so it is not trusted to size a request
+// unchecked. A longer activity is returned downsampled to this many samples.
+const maxSeriesSamples = 200000
+
+// maxSplits bounds how many splits Splits produces, so a tiny split distance
+// cannot allocate without limit.
+const maxSplits = 100000
 
 // SeriesPoint is one sample of an activity. At full resolution Garmin records
 // one per second. Optional measurements are nil when the sensor reported
@@ -56,7 +64,8 @@ type ActivitySeries struct {
 	// Total is the number of samples Garmin holds for the activity.
 	Total int
 	// Downsampled reports whether Points holds fewer samples than Total.
-	// ActivitySeries requests full resolution, so this is normally false.
+	// ActivitySeries requests full resolution, so this is normally false; it
+	// is true for activities longer than about 55 hours.
 	Downsampled bool
 }
 
@@ -107,7 +116,9 @@ func (s *ActivitySeries) UnmarshalJSON(b []byte) error {
 			p.Distance = *d
 		}
 		if ts := col(r.Metrics, "directTimestamp"); ts != nil {
-			p.Time = Timestamp{Time: time.UnixMilli(int64(*ts)).UTC()}
+			if tm, ok := unixMilli(*ts); ok {
+				p.Time = Timestamp{Time: tm}
+			}
 		}
 		s.Points = append(s.Points, p)
 	}
@@ -135,8 +146,9 @@ func (c *Client) ActivitySeries(ctx context.Context, id int64) (ActivitySeries, 
 		return ActivitySeries{}, fmt.Errorf("garmin: activity %d series: %w", id, err)
 	}
 	if s.Downsampled {
-		// Longer than the first-try size: ask for everything Garmin holds.
-		if s, err = fetch(s.Total); err != nil {
+		// Longer than the first-try size: ask for everything Garmin holds, up
+		// to the cap.
+		if s, err = fetch(min(s.Total, maxSeriesSamples)); err != nil {
 			return ActivitySeries{}, fmt.Errorf("garmin: activity %d series: %w", id, err)
 		}
 	}
@@ -176,7 +188,8 @@ func (s Split) PaceSecondsPerKm() float64 {
 // than 1 m (see elevationDeadband), which approximates Garmin's own totals.
 //
 // A final shorter segment is included with Partial set; callers that only want
-// full splits can drop it.
+// full splits can drop it. A split distance that would produce more than
+// 100,000 splits is rejected with ErrInvalidSplitSize.
 func (s ActivitySeries) Splits(splitMeters float64) ([]Split, error) {
 	if !(splitMeters > 0) || math.IsInf(splitMeters, 0) {
 		return nil, ErrInvalidSplitSize
@@ -184,6 +197,9 @@ func (s ActivitySeries) Splits(splitMeters float64) ([]Split, error) {
 	pts := monotonicPoints(s.Points)
 	if len(pts) < 2 || pts[len(pts)-1].Distance <= 0 {
 		return nil, ErrNoDistance
+	}
+	if n := pts[len(pts)-1].Distance / splitMeters; n > maxSplits {
+		return nil, fmt.Errorf("%w: %g m would make %.0f splits, more than %d", ErrInvalidSplitSize, splitMeters, math.Ceil(n), maxSplits)
 	}
 
 	bounds := splitBoundaries(pts, splitMeters)
@@ -206,15 +222,27 @@ func (s ActivitySeries) Splits(splitMeters float64) ([]Split, error) {
 // a final partial split rather than rounding noise.
 const partialEpsilon = 1e-6
 
-// monotonicPoints keeps the samples whose distance never decreases; a step
-// backwards is a GPS glitch.
+// monotonicPoints returns the samples with distance glitches removed, so that
+// distance never decreases. A sample below the last one kept is either a dip
+// (one bad reading: it is dropped) or a sign that the last one kept was a
+// spike (one reading too high: it is dropped instead). It counts as a spike
+// when the next sample is below it too and the samples either side of it agree
+// with each other; otherwise every sample after a spike would be lost until
+// the real distance caught up with it.
 func monotonicPoints(in []SeriesPoint) []SeriesPoint {
 	pts := make([]SeriesPoint, 0, len(in))
-	for _, p := range in {
-		if len(pts) > 0 && p.Distance < pts[len(pts)-1].Distance {
+	for i, p := range in {
+		n := len(pts)
+		if n == 0 || p.Distance >= pts[n-1].Distance {
+			pts = append(pts, p)
 			continue
 		}
-		pts = append(pts, p)
+		spike := pts[n-1].Distance
+		nextBelow := i+1 < len(in) && in[i+1].Distance < spike
+		if n >= 2 && nextBelow && p.Distance >= pts[n-2].Distance {
+			pts[n-1] = p // replace the spike
+		}
+		// otherwise p is a dip: skip it
 	}
 	return pts
 }

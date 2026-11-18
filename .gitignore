@@ -21,9 +21,8 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# Go workspace file
-go.work
-go.work.sum
+# The Go workspace (go.work) is committed: it builds the server against the
+# library in this repository. See "For developers" in README.md.
 
 # env file
 .env

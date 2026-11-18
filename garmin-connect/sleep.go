@@ -119,7 +119,7 @@ type SleepScores struct {
 // the recommended bedtime window is minutes after midnight (1360 is 22:40).
 type SleepNeed struct {
 	CalendarDate                string    `json:"calendarDate"`
-	Timestamp                   Timestamp `json:"timestampGmt"`
+	Time                        Timestamp `json:"timestampGmt"`
 	BaselineMins                int       `json:"baseline"`
 	ActualMins                  int       `json:"actual"`
 	Feedback                    string    `json:"feedback"`
@@ -173,16 +173,14 @@ func (c *Client) Sleep(ctx context.Context, date time.Time) (Sleep, error) {
 // SleepRange returns sleep summaries for each day in [start, end]. Days with
 // naps or sleep-need guidance but no main sleep are included (see
 // Sleep.HasSleep); days with nothing at all are absent.
-// Ranges longer than 31 days are fetched in several requests and joined.
+// Ranges longer than 31 days are fetched in several requests and joined;
+// if one fails, the days fetched before it are returned with the error.
 func (c *Client) SleepRange(ctx context.Context, start, end time.Time) ([]Sleep, error) {
 	return fetchRange(ctx, start, end, maxSleepRangeDays, c.sleepRange)
 }
 
 // sleepRange fetches a single window that fits within Garmin's range cap.
 func (c *Client) sleepRange(ctx context.Context, start, end time.Time) ([]Sleep, error) {
-	if err := checkRange(start, end); err != nil {
-		return nil, err
-	}
 	var raw json.RawMessage
 	q := url.Values{"startDate": {dateParam(start)}, "endDate": {dateParam(end)}}
 	if err := c.get(ctx, "/sleep-service/sleep/dailySleepSummariesByDate", q, &raw); err != nil {

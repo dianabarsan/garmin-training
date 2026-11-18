@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +12,10 @@ import (
 // minTokenLen is the shortest bearer token accepted. A short token can be
 // guessed, and nothing throttles attempts.
 const minTokenLen = 16
+
+// maxAuditMaxMB bounds -audit-log-max-mb (1 TiB), so converting it to bytes
+// cannot overflow.
+const maxAuditMaxMB = 1 << 20
 
 // config is everything run needs, gathered from flags and the environment.
 type config struct {
@@ -77,8 +80,8 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	if cfg.token != "" && len(cfg.token) < minTokenLen {
 		return config{}, fmt.Errorf("the token must be at least %d characters long (generate one with: openssl rand -hex 32)", minTokenLen)
 	}
-	if cfg.auditMaxMB < 0 {
-		return config{}, errors.New("-audit-log-max-mb must not be negative")
+	if cfg.auditMaxMB < 0 || cfg.auditMaxMB > maxAuditMaxMB {
+		return config{}, fmt.Errorf("-audit-log-max-mb must be between 0 and %d", maxAuditMaxMB)
 	}
 	cfg.allowedHosts = splitList(allowedHosts)
 	// Fly.io tells every machine its app's name and serves the app at
@@ -103,11 +106,11 @@ func secret(getenv func(string) string, name string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("reading %s_FILE: %w", name, err)
 		}
-		v := strings.TrimSpace(string(b))
-		if v == "" {
+		fromFile := strings.TrimSpace(string(b))
+		if fromFile == "" {
 			return "", fmt.Errorf("%s_FILE names an empty file (%s)", name, f)
 		}
-		return v, nil
+		return fromFile, nil
 	}
 	return v, nil
 }

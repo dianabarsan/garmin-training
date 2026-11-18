@@ -113,7 +113,7 @@ func IsLoopbackAddr(addr string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
+	ip := net.ParseIP(host) // SplitHostPort has removed any brackets
 	return ip != nil && ip.IsLoopback()
 }
 

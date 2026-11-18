@@ -37,6 +37,13 @@ func (f *FileStore) Load(context.Context) (Token, bool, error) {
 	if err != nil {
 		return Token{}, false, fmt.Errorf("auth: reading token file: %w", err)
 	}
+	// The file holds a live access token. One that other users can read was
+	// not written by Save (which creates it 0600); make it private.
+	if info, err := os.Stat(f.path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(f.path, 0o600); err != nil {
+			return Token{}, false, fmt.Errorf("auth: token file %s is readable by other users and could not be made private: %w", f.path, err)
+		}
+	}
 	var t Token
 	if err := json.Unmarshal(b, &t); err != nil {
 		return Token{}, false, fmt.Errorf("auth: decoding token file: %w", err)
@@ -45,7 +52,8 @@ func (f *FileStore) Load(context.Context) (Token, bool, error) {
 }
 
 // Save implements Store. The write is atomic: a crash cannot leave a
-// half-written file behind.
+// half-written file behind. The server's FileKeyStore.Save (in the root
+// module) does the same; change both together.
 func (f *FileStore) Save(_ context.Context, t Token) error {
 	b, err := json.Marshal(t)
 	if err != nil {
@@ -61,6 +69,12 @@ func (f *FileStore) Save(_ context.Context, t Token) error {
 	}
 	defer os.Remove(tmp.Name()) // no-op after a successful rename
 	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return fmt.Errorf("auth: writing token: %w", err)
+	}
+	// Flushed before the rename, so a crash cannot leave an empty file in
+	// place of a good one.
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return fmt.Errorf("auth: writing token: %w", err)
 	}

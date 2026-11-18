@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/url"
 	"time"
 )
@@ -123,16 +124,14 @@ func (d *DailySummary) UnmarshalJSON(b []byte) error {
 // DailySummaries returns one summary per day in [start, end], inclusive.
 // Days are interpreted by their calendar date in the location of the times
 // you pass.
-// Ranges longer than 300 days are fetched in several requests and joined.
+// Ranges longer than 300 days are fetched in several requests and joined;
+// if one fails, the days fetched before it are returned with the error.
 func (c *Client) DailySummaries(ctx context.Context, start, end time.Time) ([]DailySummary, error) {
 	return fetchRange(ctx, start, end, maxDailySummaryDays, c.dailySummaries)
 }
 
 // dailySummaries fetches a single window that fits within Garmin's range cap.
 func (c *Client) dailySummaries(ctx context.Context, start, end time.Time) ([]DailySummary, error) {
-	if err := checkRange(start, end); err != nil {
-		return nil, err
-	}
 	var env struct {
 		Data json.RawMessage `json:"data"`
 	}
@@ -160,16 +159,14 @@ type StepsDay struct {
 }
 
 // Steps returns daily step totals in [start, end].
-// Ranges longer than 28 days are fetched in several requests and joined.
+// Ranges longer than 28 days are fetched in several requests and joined;
+// if one fails, the days fetched before it are returned with the error.
 func (c *Client) Steps(ctx context.Context, start, end time.Time) ([]StepsDay, error) {
 	return fetchRange(ctx, start, end, maxStepsDays, c.steps)
 }
 
 // steps fetches a single window that fits within Garmin's range cap.
 func (c *Client) steps(ctx context.Context, start, end time.Time) ([]StepsDay, error) {
-	if err := checkRange(start, end); err != nil {
-		return nil, err
-	}
 	var raw json.RawMessage
 	path := "/usersummary-service/stats/steps/daily/" + dateParam(start) + "/" + dateParam(end)
 	if err := c.get(ctx, path, nil, &raw); err != nil {
@@ -203,7 +200,9 @@ type StressValues struct {
 	Other map[string]float64 `json:"other,omitempty"`
 }
 
-// UnmarshalJSON implements json.Unmarshaler. Non-numeric values are ignored.
+// UnmarshalJSON implements json.Unmarshaler. Non-numeric values are ignored,
+// except an "other" object, which is how StressValues encodes Other; reading
+// it back means encoding and decoding a StressValues gives the same value.
 func (v *StressValues) UnmarshalJSON(b []byte) error {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(b, &m); err != nil {
@@ -211,6 +210,16 @@ func (v *StressValues) UnmarshalJSON(b []byte) error {
 	}
 	*v = StressValues{}
 	for k, raw := range m {
+		if k == "other" {
+			var other map[string]float64
+			if json.Unmarshal(raw, &other) == nil && len(other) > 0 {
+				if v.Other == nil {
+					v.Other = map[string]float64{}
+				}
+				maps.Copy(v.Other, other)
+			}
+			continue
+		}
 		var f float64
 		// Unmarshalling null into a float succeeds and yields 0, so check for it
 		// explicitly or a null would be recorded as a real zero.
@@ -239,16 +248,14 @@ func (v *StressValues) UnmarshalJSON(b []byte) error {
 }
 
 // Stress returns daily stress statistics in [start, end].
-// Ranges longer than 28 days are fetched in several requests and joined.
+// Ranges longer than 28 days are fetched in several requests and joined;
+// if one fails, the days fetched before it are returned with the error.
 func (c *Client) Stress(ctx context.Context, start, end time.Time) ([]StressDay, error) {
 	return fetchRange(ctx, start, end, maxStressDays, c.stress)
 }
 
 // stress fetches a single window that fits within Garmin's range cap.
 func (c *Client) stress(ctx context.Context, start, end time.Time) ([]StressDay, error) {
-	if err := checkRange(start, end); err != nil {
-		return nil, err
-	}
 	var raw json.RawMessage
 	path := "/usersummary-service/stats/stress/daily/" + dateParam(start) + "/" + dateParam(end)
 	if err := c.get(ctx, path, nil, &raw); err != nil {

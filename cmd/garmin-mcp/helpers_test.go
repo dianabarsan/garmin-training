@@ -62,7 +62,7 @@ func start(t *testing.T, env map[string]string, args ...string) (base string, lo
 	done := make(chan error, 1)
 	all := append([]string{"-addr", "127.0.0.1:0"}, args...)
 	go func() {
-		done <- run(ctx, all, func(k string) string { return env[k] }, logs, func(a string) { ready <- a })
+		done <- run(ctx, all, func(k string) string { return env[k] }, io.Discard, logs, func(a string) { ready <- a })
 	}()
 	select {
 	case addr := <-ready:

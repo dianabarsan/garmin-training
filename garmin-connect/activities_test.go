@@ -308,8 +308,17 @@ func TestDownloadActivity_Error(t *testing.T) {
 func TestDownloadActivity_WriterError(t *testing.T) {
 	t.Parallel()
 	c, _ := serve(t, "data")
-	if err := c.DownloadActivity(context.Background(), 1, failWriter{}); err == nil {
-		t.Error("expected writer error")
+	err := c.DownloadActivity(context.Background(), 1, failWriter{})
+	if err == nil || !strings.Contains(err.Error(), "writing") {
+		t.Errorf("err = %v, want a write error labelled as such", err)
+	}
+}
+
+func TestDownloadActivity_NoContentIsAnError(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := noContentClient(t).DownloadActivity(context.Background(), 1, &buf); !errors.Is(err, garminconnect.ErrEmptyResponse) {
+		t.Errorf("err = %v, want ErrEmptyResponse", err)
 	}
 }
 

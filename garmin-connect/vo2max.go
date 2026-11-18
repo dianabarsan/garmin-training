@@ -38,10 +38,16 @@ type VO2MaxDay struct {
 // sports (such as "running" or "cycling", case-insensitive) keeps only entries
 // that carry an estimate for one of them; an unknown sport is rejected by
 // Garmin with HTTP 400. A range with no entries returns an empty slice.
+// Ranges longer than 366 days are fetched in several requests and joined;
+// if one fails, the days fetched before it are returned with the error.
 func (c *Client) VO2Max(ctx context.Context, start, end time.Time, sports ...string) ([]VO2MaxDay, error) {
-	if err := checkRange(start, end); err != nil {
-		return nil, err
-	}
+	return fetchRange(ctx, start, end, maxVO2MaxDays, func(ctx context.Context, start, end time.Time) ([]VO2MaxDay, error) {
+		return c.vo2Max(ctx, start, end, sports)
+	})
+}
+
+// vo2Max fetches one window of at most maxVO2MaxDays.
+func (c *Client) vo2Max(ctx context.Context, start, end time.Time, sports []string) ([]VO2MaxDay, error) {
 	var q url.Values
 	for _, s := range sports {
 		if q == nil {

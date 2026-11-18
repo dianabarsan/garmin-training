@@ -3,10 +3,16 @@ package garminconnect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 )
+
+// ErrNoZones is returned by HeartRateZonesFor when neither the sport nor
+// DEFAULT has zones. It is not ErrNotFound: the request succeeded, and the
+// user simply has no matching configuration.
+var ErrNoZones = errors.New("garmin: no heart rate zones configured")
 
 // HeartRateZone is one training zone as an inclusive beats-per-minute range.
 type HeartRateZone struct {
@@ -125,7 +131,7 @@ func (c *Client) HeartRateZones(ctx context.Context, opts ...ZonesOption) ([]Hea
 
 // HeartRateZonesFor returns the zones that apply to sport (case-insensitive,
 // e.g. "running"), falling back to the DEFAULT zones when the sport has none of
-// its own. It returns ErrNotFound when neither exists.
+// its own. It returns ErrNoZones when neither exists.
 func (c *Client) HeartRateZonesFor(ctx context.Context, sport string, opts ...ZonesOption) (HeartRateZones, error) {
 	all, err := c.HeartRateZones(ctx, opts...)
 	if err != nil {
@@ -143,5 +149,5 @@ func (c *Client) HeartRateZonesFor(ctx context.Context, sport string, opts ...Zo
 	if fallback != nil {
 		return *fallback, nil
 	}
-	return HeartRateZones{}, fmt.Errorf("%w: no heart rate zones for %q", ErrNotFound, sport)
+	return HeartRateZones{}, fmt.Errorf("%w for %q, and no DEFAULT zones", ErrNoZones, sport)
 }

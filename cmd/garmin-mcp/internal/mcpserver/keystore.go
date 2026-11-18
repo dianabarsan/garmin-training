@@ -25,11 +25,21 @@ func (f *FileKeyStore) Load() (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("reading key file: %w", err)
 	}
+	// One that other users can read was not written by Save (which creates it
+	// 0600); make it private. The server warns about this at startup too.
+	if info, err := os.Stat(f.path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(f.path, 0o600); err != nil {
+			return "", false, fmt.Errorf("key file is readable by other users and could not be made private: %w", err)
+		}
+	}
 	key := strings.TrimSpace(string(b))
 	return key, key != "", nil
 }
 
 // Save implements KeyStore. The write is atomic and the file is created 0600.
+//
+// It matches auth.FileStore.Save in the garmin-connect module. The two are
+// not shared because that module keeps no helpers for this one to import.
 func (f *FileKeyStore) Save(key string) error {
 	dir := filepath.Dir(f.path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

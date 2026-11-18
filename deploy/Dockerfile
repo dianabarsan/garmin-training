@@ -6,7 +6,11 @@ ARG GO_VERSION=1.27
 
 FROM golang:${GO_VERSION} AS build
 WORKDIR /src
-COPY go.mod go.sum ./
+# The library is its own module; the workspace (go.work) builds the server
+# against the copy in this repository, so its go.mod must be present before the
+# download.
+COPY go.work go.work.sum go.mod go.sum ./
+COPY garmin-connect/go.mod ./garmin-connect/
 RUN go mod download
 # Only the source directories are copied, so a stray `key` file in the root cannot
 # end up in the image; .dockerignore keeps captured data (testdata/live) out.
